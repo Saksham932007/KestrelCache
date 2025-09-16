@@ -1,0 +1,10 @@
+{
+  "version": 2,
+  "dgSpecHash": "hpTGmkNO7Us=",
+  "success": true,
+  "projectFilePath": "/home/sakshamkapoor/Projects/database/database.csproj",
+  "expectedPackageFiles": [
+    "/home/sakshamkapoor/.nuget/packages/system.io.hashing/9.0.9/system.io.hashing.9.0.9.nupkg.sha512"
+  ],
+  "logs": []
+}
