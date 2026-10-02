@@ -15,6 +15,8 @@ Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "benchmarks", "benchmarks", 
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "KestrelCache.Benchmarks", "benchmarks\KestrelCache.Benchmarks\KestrelCache.Benchmarks.csproj", "{F4C40066-7026-475C-BB36-D8923EDE8F49}"
 EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "KestrelCache.Server", "src\KestrelCache.Server\KestrelCache.Server.csproj", "{411E0700-052E-4282-B782-9320412AF76D}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|Any CPU = Debug|Any CPU
@@ -73,6 +75,18 @@ Global
 		{F4C40066-7026-475C-BB36-D8923EDE8F49}.Release|x64.Build.0 = Release|Any CPU
 		{F4C40066-7026-475C-BB36-D8923EDE8F49}.Release|x86.ActiveCfg = Release|Any CPU
 		{F4C40066-7026-475C-BB36-D8923EDE8F49}.Release|x86.Build.0 = Release|Any CPU
+		{411E0700-052E-4282-B782-9320412AF76D}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{411E0700-052E-4282-B782-9320412AF76D}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{411E0700-052E-4282-B782-9320412AF76D}.Debug|x64.ActiveCfg = Debug|Any CPU
+		{411E0700-052E-4282-B782-9320412AF76D}.Debug|x64.Build.0 = Debug|Any CPU
+		{411E0700-052E-4282-B782-9320412AF76D}.Debug|x86.ActiveCfg = Debug|Any CPU
+		{411E0700-052E-4282-B782-9320412AF76D}.Debug|x86.Build.0 = Debug|Any CPU
+		{411E0700-052E-4282-B782-9320412AF76D}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{411E0700-052E-4282-B782-9320412AF76D}.Release|Any CPU.Build.0 = Release|Any CPU
+		{411E0700-052E-4282-B782-9320412AF76D}.Release|x64.ActiveCfg = Release|Any CPU
+		{411E0700-052E-4282-B782-9320412AF76D}.Release|x64.Build.0 = Release|Any CPU
+		{411E0700-052E-4282-B782-9320412AF76D}.Release|x86.ActiveCfg = Release|Any CPU
+		{411E0700-052E-4282-B782-9320412AF76D}.Release|x86.Build.0 = Release|Any CPU
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE
@@ -82,5 +96,6 @@ Global
 		{2BD97451-D425-4543-B196-CCB20C434186} = {827E0CD3-B72D-47B6-A68D-7590B98EB39B}
 		{6505A367-C82A-40A3-B605-241DDC23B435} = {827E0CD3-B72D-47B6-A68D-7590B98EB39B}
 		{F4C40066-7026-475C-BB36-D8923EDE8F49} = {66320409-64EC-F7C5-3DEF-65E7510DAAD1}
+		{411E0700-052E-4282-B782-9320412AF76D} = {827E0CD3-B72D-47B6-A68D-7590B98EB39B}
 	EndGlobalSection
 EndGlobal

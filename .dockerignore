@@ -1,0 +1,16 @@
+**/bin/
+**/obj/
+artifacts/
+.git/
+.github/
+.vs/
+.idea/
+.vscode/
+*.db
+*.kc
+*.wal
+*.sst
+deploy/grafana/data/
+docs/
+*.md
+!README.md

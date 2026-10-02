@@ -26,11 +26,25 @@ public sealed record EngineStats
     /// <summary>Whether <see cref="KeyCount"/> is an exact live-key count or an upper bound.</summary>
     public bool KeyCountIsExact { get; init; }
 
-    /// <summary>Bytes occupied on disk by all files the engine owns.</summary>
+    /// <summary>Total bytes occupied on disk by every file the engine owns.</summary>
     public long DiskSizeBytes { get; init; }
 
-    /// <summary>Bytes of user key+value data still live, ignoring stale and deleted records.</summary>
+    /// <summary>
+    /// Bytes of user key+value data still live. Exact only when <see cref="KeyCountIsExact"/>
+    /// is true; see <see cref="StaleRatio"/>.
+    /// </summary>
     public long LiveDataBytes { get; init; }
+
+    /// <summary>
+    /// Bytes held in the main data files: the log for Bitcask, the SSTables for the LSM engine.
+    /// </summary>
+    public long DataFileBytes { get; init; }
+
+    /// <summary>
+    /// Bytes held in the write-ahead log, which the LSM engine keeps separately from its data
+    /// files. Zero for Bitcask, whose log <i>is</i> its data file.
+    /// </summary>
+    public long WriteAheadLogBytes { get; init; }
 
     /// <summary>Completed read operations.</summary>
     public long Reads { get; init; }
@@ -66,10 +80,32 @@ public sealed record EngineStats
     public IReadOnlyList<int> SsTablesPerLevel { get; init; } = [];
 
     /// <summary>
-    /// Fraction of on-disk bytes that are stale (superseded or deleted). Drives compaction
-    /// decisions in the Bitcask engine and is the headline space-amplification number.
+    /// Fraction of the <i>data files</i> that is stale — superseded values and tombstones. This
+    /// is the headline space-amplification number and what drives the Bitcask engine's
+    /// compaction decisions.
     /// </summary>
-    public double StaleRatio => DiskSizeBytes == 0 ? 0 : 1.0 - ((double)LiveDataBytes / DiskSizeBytes);
+    /// <remarks>
+    /// <para>
+    /// Two details here were wrong in an earlier version and are worth stating explicitly.
+    /// </para>
+    /// <para>
+    /// First, the denominator is <see cref="DataFileBytes"/> and not
+    /// <see cref="DiskSizeBytes"/>. Including the write-ahead log would count it as garbage,
+    /// which it is not — it is the durability record for data that has not yet been written to a
+    /// table. A freshly written LSM database reported a stale ratio of 100% for precisely that
+    /// reason, which is alarming and meaningless.
+    /// </para>
+    /// <para>
+    /// Second, this returns zero when <see cref="KeyCountIsExact"/> is false, because the LSM
+    /// engine cannot measure live bytes without merging its levels. Reporting a computed-looking
+    /// number from an unknown numerator would be worse than reporting nothing;
+    /// <c>SsTablesPerLevel</c> and <c>CompactionBytesWritten</c> are the signals to watch there.
+    /// </para>
+    /// </remarks>
+    public double StaleRatio =>
+        !KeyCountIsExact || DataFileBytes == 0
+            ? 0
+            : Math.Clamp(1.0 - ((double)LiveDataBytes / DataFileBytes), 0, 1);
 
     /// <summary>Block cache hit rate in [0, 1].</summary>
     public double BlockCacheHitRate =>

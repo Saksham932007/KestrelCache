@@ -1,0 +1,77 @@
+# Alerting rules worth having, each chosen because it catches a failure mode the storage engine
+# can genuinely get into rather than because it is a round number.
+groups:
+  - name: kestrelcache
+    rules:
+      - alert: KestrelCacheDown
+        expr: up{job="kestrelcache"} == 0
+        for: 30s
+        labels:
+          severity: critical
+        annotations:
+          summary: "KestrelCache is not responding to scrapes"
+
+      - alert: TailLatencyHigh
+        # p99 over a five-minute window. Tail latency, not the mean: a mean stays flat while one
+        # request in a hundred stalls behind a compaction.
+        expr: |
+          histogram_quantile(
+            0.99,
+            sum(rate(kestrelcache_command_duration_seconds_bucket[5m])) by (le)
+          ) > 0.05
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "p99 command latency above 50 ms"
+
+      - alert: Level0Backlog
+        # Level 0 holding many files means compaction is not keeping pace with writes. Reads
+        # degrade first, because every level-0 table has to be consulted on every lookup; if it
+        # keeps climbing, the tree is losing.
+        expr: kestrelcache_engine_sstables{level="0"} > 12
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Level 0 has {{ $value }} SSTables; compaction is falling behind"
+
+      - alert: BlockCacheThrashing
+        expr: kestrelcache_engine_block_cache_hit_rate < 0.5
+        for: 10m
+        labels:
+          severity: info
+        annotations:
+          summary: "Block cache hit rate below 50%; the working set may exceed the cache"
+
+      - alert: BloomFilterIneffective
+        # A false-positive rate far above the configured bits-per-key implies something is wrong
+        # with the filter rather than with the workload -- which is exactly the bug this project
+        # hit once, where a hash collided on dense numeric keys.
+        expr: |
+          rate(kestrelcache_engine_bloom_false_positives_total[10m])
+          /
+          clamp_min(
+            rate(kestrelcache_engine_bloom_false_positives_total[10m])
+            + rate(kestrelcache_engine_bloom_negatives_total[10m]),
+            0.001
+          ) > 0.05
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Bloom filter false-positive rate above 5%"
+
+      - alert: NoCompactionProgress
+        # Write-heavy but compaction has stopped: either it is wedged or it has failed, and
+        # either way the tree only gets worse from here.
+        expr: |
+          rate(kestrelcache_engine_writes_total[15m]) > 100
+          and rate(kestrelcache_engine_compaction_bytes_total[15m]) == 0
+          and kestrelcache_engine_sstables{level="0"} > 4
+        for: 15m
+        labels:
+          severity: critical
+          
+        annotations:
+          summary: "Writes are flowing but no compaction has made progress in 15 minutes"

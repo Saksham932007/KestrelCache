@@ -86,6 +86,108 @@ jobs:
           dotnet ./benchmarks/KestrelCache.Benchmarks/bin/Release/net9.0/kestrel-bench.dll
           latency --root "${{ runner.temp }}/kestrel-bench" --ops 2000
 
+  container:
+    name: container image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build the image
+        run: docker build -t kestrelcache:ci .
+
+      # A built image that does not serve is not a built image. This starts the container, waits
+      # for the health endpoint, and drives it with the real redis-cli -- which is the whole
+      # compatibility claim, verified rather than asserted.
+      - name: Start the server
+        run: |
+          docker run -d --name kestrelcache-ci -p 6380:6380 -p 9180:9180 kestrelcache:ci
+          for i in $(seq 1 30); do
+            if curl -sf http://127.0.0.1:9180/health > /dev/null; then break; fi
+            sleep 1
+          done
+          curl -sf http://127.0.0.1:9180/health
+
+      - name: Exercise it with the real redis-cli
+        run: |
+          cli() { docker run --rm --network host redis:7-alpine redis-cli -p 6380 "$@"; }
+          test "$(cli PING)" = "PONG"
+          test "$(cli SET ci-key ci-value)" = "OK"
+          test "$(cli GET ci-key)" = "ci-value"
+          test "$(cli INCR ci-counter)" = "1"
+          test "$(cli MSET a 1 b 2)" = "OK"
+          cli KEYS '*'
+          cli INFO engine
+          echo "redis-cli compatibility verified"
+
+      - name: Confirm the metrics endpoint exports what the dashboard queries
+        run: |
+          metrics=$(curl -sf http://127.0.0.1:9180/metrics)
+          for name in \
+            kestrelcache_up \
+            kestrelcache_commands_total \
+            kestrelcache_command_duration_seconds_bucket \
+            kestrelcache_engine_sstables \
+            kestrelcache_engine_bloom_negatives_total \
+            kestrelcache_engine_block_cache_hit_rate \
+            kestrelcache_engine_wal_bytes
+          do
+            echo "$metrics" | grep -q "^$name" || { echo "missing metric: $name"; exit 1; }
+          done
+          echo "all dashboard metrics present"
+
+      - name: Check that it shuts down cleanly
+        run: |
+          # SIGTERM must produce an orderly stop with a final fsync, not a kill. A non-zero exit
+          # code here means the shutdown path threw, which in a container reads as a crash loop.
+          docker stop --time 20 kestrelcache-ci
+          code=$(docker inspect -f '{{.State.ExitCode}}' kestrelcache-ci)
+          docker logs kestrelcache-ci
+          test "$code" = "0" || { echo "unclean shutdown, exit code $code"; exit 1; }
+          echo "shut down cleanly"
+
+      - name: Clean up
+        if: always()
+        run: docker rm -f kestrelcache-ci || true
+
+  compose:
+    name: compose stack
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Bring the stack up
+        run: docker compose -f deploy/docker-compose.yml up -d --build --wait --wait-timeout 180
+
+      - name: Verify Prometheus is scraping the database
+        run: |
+          for i in $(seq 1 30); do
+            health=$(curl -s http://127.0.0.1:9090/api/v1/targets \
+              | python3 -c "import json,sys;print(next((t['health'] for t in json.load(sys.stdin)['data']['activeTargets'] if t['labels']['job']=='kestrelcache'),'absent'))")
+            if [ "$health" = "up" ]; then echo "target up"; exit 0; fi
+            sleep 2
+          done
+          curl -s http://127.0.0.1:9090/api/v1/targets
+          echo "Prometheus never scraped the database successfully"
+          exit 1
+
+      - name: Verify Grafana provisioned the datasource and dashboard
+        run: |
+          for i in $(seq 1 45); do
+            curl -sf http://127.0.0.1:3000/api/health > /dev/null && break
+            sleep 2
+          done
+          curl -sf http://127.0.0.1:3000/api/datasources | grep -q kestrelcache-prometheus
+          curl -sf "http://127.0.0.1:3000/api/dashboards/uid/kestrelcache-overview" | grep -q '"title": *"KestrelCache"'
+          echo "Grafana provisioning verified"
+
+      - name: Dump logs on failure
+        if: failure()
+        run: docker compose -f deploy/docker-compose.yml logs
+
+      - name: Tear down
+        if: always()
+        run: docker compose -f deploy/docker-compose.yml down -v || true
+
   format:
     name: format
     runs-on: ubuntu-latest

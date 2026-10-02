@@ -1,0 +1,14 @@
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    uid: kestrelcache-prometheus
+    jsonData:
+      # Must match prometheus.yml's scrape_interval, or Grafana's $__rate_interval computes a
+      # window too short for rate() and the graphs come out full of gaps.
+      timeInterval: 5s
+      httpMethod: POST

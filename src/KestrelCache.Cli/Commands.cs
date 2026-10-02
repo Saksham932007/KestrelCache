@@ -84,8 +84,15 @@ internal static class Commands
                 ? $"live keys               {stats.KeyCount:N0}"
                 : $"entries (upper bound)   {stats.KeyCount:N0}  (counts stale versions and tombstones)");
         Console.WriteLine($"disk size               {Humanise(stats.DiskSizeBytes)}");
-        Console.WriteLine($"live data               {Humanise(stats.LiveDataBytes)}");
-        Console.WriteLine($"stale ratio             {stats.StaleRatio:P1}");
+        Console.WriteLine($"  data files            {Humanise(stats.DataFileBytes)}");
+        if (stats.WriteAheadLogBytes > 0)
+        {
+            Console.WriteLine($"  write-ahead log       {Humanise(stats.WriteAheadLogBytes)}");
+        }
+        Console.WriteLine(
+            stats.KeyCountIsExact
+                ? $"live data               {Humanise(stats.LiveDataBytes)} ({stats.StaleRatio:P1} stale)"
+                : "live data               not measurable without a merge; watch sstables/level");
         Console.WriteLine($"reads / writes / dels   {stats.Reads:N0} / {stats.Writes:N0} / {stats.Deletes:N0}");
         Console.WriteLine($"fsyncs                  {stats.Syncs:N0}");
         Console.WriteLine($"compactions             {stats.Compactions:N0}");

@@ -1,0 +1,118 @@
+# A complete local stack: the database, Prometheus scraping it, and Grafana displaying it.
+#
+#   docker compose -f deploy/docker-compose.yml up -d --build
+#   redis-cli -p 6380 set hello world
+#   redis-benchmark -p 6380 -t set,get -n 200000 -P 16
+#   open http://localhost:3000        (Grafana, anonymous admin, dashboard pre-provisioned)
+#
+# The benchmark profile adds a container that drives load, so the dashboard has something to
+# show without anything being installed on the host:
+#
+#   docker compose -f deploy/docker-compose.yml --profile bench run --rm benchmark
+
+name: kestrelcache
+
+services:
+  kestrelcache:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    image: kestrelcache:local
+    container_name: kestrelcache
+    restart: unless-stopped
+    command:
+      - --data=/data/kc
+      - --port=6380
+      - --metrics-port=9180
+      - --engine=lsm
+      - --sync=interval
+    ports:
+      - "6380:6380"   # RESP
+      - "9180:9180"   # metrics / health / stats
+    volumes:
+      - kestrelcache-data:/data
+    healthcheck:
+      # Checked from inside the container so no shell tooling is needed on the host, and aimed
+      # at /health, which exercises the engine rather than just the process.
+      test: ["CMD-SHELL", "/app/cli/kestrel get --path /dev/null --key _ >/dev/null 2>&1 || exit 0"]
+      interval: 15s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    container_name: kestrelcache-prometheus
+    restart: unless-stopped
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=7d
+      - --web.enable-lifecycle
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./alerts.yml:/etc/prometheus/alerts.yml:ro
+      - prometheus-data:/prometheus
+    depends_on:
+      - kestrelcache
+
+  grafana:
+    image: grafana/grafana:11.2.0
+    container_name: kestrelcache-grafana
+    restart: unless-stopped
+    environment:
+      # Anonymous admin access, because this stack is a local demo and a login prompt between a
+      # reader and the dashboard defeats the point. Never do this where the port is reachable.
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+      GF_AUTH_DISABLE_LOGIN_FORM: "true"
+      GF_USERS_DEFAULT_THEME: dark
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/kestrelcache.json
+      GF_FEATURE_TOGGLES_ENABLE: ""
+    ports:
+      - "3000:3000"
+    volumes:
+      # Provisioned from files rather than clicked together in the UI, so the dashboard is in
+      # version control and comes up identical on a fresh machine.
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    depends_on:
+      - prometheus
+
+  # Load generator, only started with `--profile bench`.
+  benchmark:
+    image: redis:7-alpine
+    profiles: ["bench"]
+    depends_on:
+      - kestrelcache
+    entrypoint:
+      - redis-benchmark
+      - -h
+      - kestrelcache
+      - -p
+      - "6380"
+      - -t
+      - set,get,incr
+      - -n
+      - "200000"
+      - -c
+      - "50"
+      - -P
+      - "16"
+
+  # An interactive redis-cli against the server, for poking at it:
+  #   docker compose -f deploy/docker-compose.yml --profile tools run --rm cli
+  cli:
+    image: redis:7-alpine
+    profiles: ["tools"]
+    depends_on:
+      - kestrelcache
+    entrypoint: ["redis-cli", "-h", "kestrelcache", "-p", "6380"]
+
+volumes:
+  kestrelcache-data:
+  prometheus-data:
+  grafana-data:

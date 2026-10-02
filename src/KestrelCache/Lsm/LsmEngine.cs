@@ -54,6 +54,7 @@ public sealed class LsmEngine : IScannableStorageEngine
     private readonly CancellationTokenSource _shutdown = new();
     private readonly Task? _maintenanceLoop;
 
+    private readonly System.Collections.Concurrent.ConcurrentQueue<PendingWrite> _writeQueue = new();
     private readonly object _snapshotGate = new();
     private readonly SortedSet<ulong> _snapshotSequences = [];
     private readonly List<LsmVersion> _liveVersions = [];
@@ -84,6 +85,21 @@ public sealed class LsmEngine : IScannableStorageEngine
     /// observe a memtable that has been frozen but whose replacement is not yet in place.
     /// </summary>
     private sealed record MemState(Memtable Active, IReadOnlyList<Memtable> Immutable);
+
+    /// <summary>One caller's batch, waiting to be committed by whichever writer holds the lock.</summary>
+    private sealed class PendingWrite(WriteBatch batch)
+    {
+        internal WriteBatch Batch { get; } = batch;
+
+        internal TaskCompletionSource Completion { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+    }
+
+    /// <summary>Most batches one group commit will absorb, so a burst cannot build an unbounded buffer.</summary>
+    private const int MaxGroupBatches = 1024;
+
+    /// <summary>Most individual mutations one group commit will absorb.</summary>
+    private const int MaxGroupOperations = 16 * 1024;
 
     private LsmEngine(
         DatabaseOptions options,
@@ -424,7 +440,30 @@ public sealed class LsmEngine : IScannableStorageEngine
         return WriteAsync(new WriteBatch().Delete(key), cancellationToken);
     }
 
-    /// <inheritdoc />
+    /// <summary>
+    /// Applies a batch atomically, joining a group commit with any other writes in flight.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Every write still has to be serialised — the log is one file and the memtable takes one
+    /// writer — but serialising them one at a time means each pays for its own lock acquisition,
+    /// its own <c>pwrite</c> and, under a strict durability policy, its own <c>fsync</c>. Under
+    /// concurrent load that made the lock the queue: measured throughput was flat at roughly
+    /// 49,000 writes/sec whether fsync was enabled or disabled, and client-side pipelining
+    /// lifted it by only 20% while lifting reads by 4.7x.
+    /// </para>
+    /// <para>
+    /// Group commit fixes the shape rather than the constant. A caller enqueues its batch and
+    /// then tries for the lock; whoever gets it becomes the leader and commits <i>everything</i>
+    /// queued — one lock acquisition, one write, one fsync for the whole group — then wakes the
+    /// others. The busier the server, the larger the groups and the better the amortisation,
+    /// which is the opposite of how the one-at-a-time path degraded.
+    /// </para>
+    /// <para>
+    /// Each batch keeps its own log record, so this changes nothing about atomicity: a batch is
+    /// still all-or-nothing, and a torn record still loses exactly one.
+    /// </para>
+    /// </remarks>
     public async ValueTask WriteAsync(WriteBatch batch, CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(batch);
@@ -438,40 +477,19 @@ public sealed class LsmEngine : IScannableStorageEngine
             ValidateSizes(op.Key, op.Value);
         }
 
-        bool shouldFreeze;
-        Memtable? frozen = null;
+        var pending = new PendingWrite(batch);
+        _writeQueue.Enqueue(pending);
+
+        bool frozeMemtable = false;
 
         await _writeLock.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
-            ulong firstSequence = _lastSequence + 1;
-
-            // Log first, then memtable. The reverse order would make a write visible before it
-            // was recoverable, so a crash could lose a read that had already been served.
-            await _wal.AppendAsync(firstSequence, batch.Ops, cancellationToken).ConfigureAwait(false);
-            SyncIfRequired();
-
-            var mem = Volatile.Read(ref _mem);
-            ulong sequence = firstSequence;
-
-            foreach (var op in batch.Ops)
+            // A leader that arrived earlier may already have committed this batch, in which case
+            // there is nothing to do but release the lock.
+            if (!pending.Completion.Task.IsCompleted)
             {
-                mem.Active.Add(
-                    sequence++,
-                    op.IsDelete ? ValueKind.Deletion : ValueKind.Value,
-                    op.Key,
-                    op.Value ?? []);
-            }
-
-            _lastSequence = sequence - 1;
-
-            // Publishing last is what gives the batch atomic visibility.
-            Volatile.Write(ref _publishedSequence, _lastSequence);
-
-            shouldFreeze = mem.Active.ApproximateBytes >= _options.MemtableSizeBytes;
-            if (shouldFreeze)
-            {
-                frozen = FreezeActiveMemtable();
+                frozeMemtable = await CommitGroupAsync(cancellationToken).ConfigureAwait(false);
             }
         }
         finally
@@ -479,13 +497,10 @@ public sealed class LsmEngine : IScannableStorageEngine
             _writeLock.Release();
         }
 
-        foreach (var op in batch.Ops)
-        {
-            if (op.IsDelete) Interlocked.Increment(ref _deletes);
-            else Interlocked.Increment(ref _writes);
-        }
+        // Rethrows if the group this batch belonged to failed.
+        await pending.Completion.Task.ConfigureAwait(false);
 
-        if (frozen is not null)
+        if (frozeMemtable)
         {
             if (_options.EnableBackgroundCompaction)
             {
@@ -497,6 +512,100 @@ public sealed class LsmEngine : IScannableStorageEngine
                 // deterministic tree after every write.
                 await RunMaintenanceAsync(compact: false, cancellationToken).ConfigureAwait(false);
             }
+        }
+    }
+
+    /// <summary>
+    /// Commits every batch currently queued. Called holding the write lock. Returns whether the
+    /// active memtable was frozen and so needs flushing.
+    /// </summary>
+    private async Task<bool> CommitGroupAsync(CancellationToken cancellationToken)
+    {
+        var group = new List<PendingWrite>();
+        int operationCount = 0;
+
+        while (group.Count < MaxGroupBatches
+            && operationCount < MaxGroupOperations
+            && _writeQueue.TryDequeue(out var queued))
+        {
+            group.Add(queued);
+            operationCount += queued.Batch.Count;
+        }
+
+        if (group.Count == 0) return false;
+
+        try
+        {
+            ulong firstSequence = _lastSequence + 1;
+
+            var records = new List<(ulong FirstSequence, IReadOnlyList<WriteOp> Operations)>(group.Count);
+            ulong sequence = firstSequence;
+            foreach (var queued in group)
+            {
+                records.Add((sequence, queued.Batch.Ops));
+                sequence += (ulong)queued.Batch.Count;
+            }
+
+            // Log first, then memtable. The reverse order would make a write visible before it
+            // was recoverable, so a crash could lose a read that had already been served.
+            await _wal.AppendGroupAsync(records, cancellationToken).ConfigureAwait(false);
+            SyncIfRequired();
+
+            var mem = Volatile.Read(ref _mem);
+            ulong cursor = firstSequence;
+
+            foreach (var queued in group)
+            {
+                foreach (var op in queued.Batch.Ops)
+                {
+                    mem.Active.Add(
+                        cursor++,
+                        op.IsDelete ? ValueKind.Deletion : ValueKind.Value,
+                        op.Key,
+                        op.Value ?? []);
+                }
+            }
+
+            _lastSequence = cursor - 1;
+
+            // Publishing last is what gives every batch in the group atomic visibility: a reader
+            // works at the previously published sequence until the whole group is in place.
+            Volatile.Write(ref _publishedSequence, _lastSequence);
+
+            foreach (var queued in group)
+            {
+                foreach (var op in queued.Batch.Ops)
+                {
+                    if (op.IsDelete) Interlocked.Increment(ref _deletes);
+                    else Interlocked.Increment(ref _writes);
+                }
+            }
+
+            foreach (var queued in group)
+            {
+                queued.Completion.TrySetResult();
+            }
+
+            if (mem.Active.ApproximateBytes >= _options.MemtableSizeBytes)
+            {
+                FreezeActiveMemtable();
+                return true;
+            }
+
+            return false;
+        }
+        catch (Exception exception)
+        {
+            // Every batch in the group shares the fate of the single append, so every caller is
+            // told the same thing: the write did not happen. The exception is delivered through
+            // the completions rather than thrown, so the leader learns of it the same way a
+            // follower does and no caller is left waiting.
+            foreach (var queued in group)
+            {
+                queued.Completion.TrySetException(exception);
+            }
+
+            return false;
         }
     }
 
@@ -1242,7 +1351,8 @@ public sealed class LsmEngine : IScannableStorageEngine
         var version = Volatile.Read(ref _version);
         var mem = Volatile.Read(ref _mem);
 
-        long diskSize = version.TotalSizeBytes + _wal.SizeBytes;
+        long tableBytes = version.TotalSizeBytes;
+        long walBytes = _wal.SizeBytes;
 
         return new EngineStats
         {
@@ -1251,8 +1361,14 @@ public sealed class LsmEngine : IScannableStorageEngine
             KeyCount = version.TotalEntryCount + mem.Active.Count
                 + mem.Immutable.Sum(m => (long)m.Count),
             KeyCountIsExact = false,
-            DiskSizeBytes = diskSize,
-            LiveDataBytes = version.TotalSizeBytes,
+            DiskSizeBytes = tableBytes + walBytes,
+            DataFileBytes = tableBytes,
+            WriteAheadLogBytes = walBytes,
+
+            // Bytes resident in SSTables, stale versions included. Marked inexact by
+            // KeyCountIsExact above, which is what keeps StaleRatio from reporting a number it
+            // cannot actually compute.
+            LiveDataBytes = tableBytes,
             Reads = Interlocked.Read(ref _reads),
             Writes = Interlocked.Read(ref _writes),
             Deletes = Interlocked.Read(ref _deletes),

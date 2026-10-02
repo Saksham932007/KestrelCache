@@ -107,60 +107,135 @@ internal sealed class WriteAheadLog : IAsyncDisposable
         IReadOnlyList<WriteOp> operations,
         CancellationToken cancellationToken = default)
     {
-        int payloadSize = Varint.SizeOf(firstSequence) + Varint.SizeOf((uint)operations.Count);
-
-        foreach (var op in operations)
-        {
-            payloadSize += 1
-                + Varint.SizeOf((uint)op.Key.Length)
-                + op.Key.Length;
-
-            if (!op.IsDelete)
-            {
-                payloadSize += Varint.SizeOf((uint)op.Value!.Length) + op.Value.Length;
-            }
-        }
-
-        int total = HeaderSize + payloadSize;
+        int total = HeaderSize + PayloadSizeOf(firstSequence, operations);
         byte[] rented = ArrayPool<byte>.Shared.Rent(total);
 
         try
         {
-            var record = rented.AsSpan(0, total);
-            var payload = record[HeaderSize..];
-            int cursor = 0;
-
-            cursor += Varint.Write(payload[cursor..], firstSequence);
-            cursor += Varint.Write(payload[cursor..], (uint)operations.Count);
-
-            foreach (var op in operations)
-            {
-                payload[cursor++] = (byte)(op.IsDelete ? ValueKind.Deletion : ValueKind.Value);
-                cursor += Varint.Write(payload[cursor..], (uint)op.Key.Length);
-                op.Key.CopyTo(payload[cursor..]);
-                cursor += op.Key.Length;
-
-                if (!op.IsDelete)
-                {
-                    cursor += Varint.Write(payload[cursor..], (uint)op.Value!.Length);
-                    op.Value.CopyTo(payload[cursor..]);
-                    cursor += op.Value.Length;
-                }
-            }
-
-            BinaryPrimitives.WriteUInt32LittleEndian(record[4..], (uint)cursor);
-
-            // The checksum spans the length field as well as the payload, so a corrupt length
-            // cannot send the reader off to parse garbage.
-            uint crc = Crc32.HashToUInt32(record[4..(HeaderSize + cursor)]);
-            BinaryPrimitives.WriteUInt32LittleEndian(record, crc);
+            int written = EncodeRecord(rented.AsSpan(0, total), firstSequence, operations);
 
             long offset = _offset;
             await PositionalIo
-                .WriteAllAsync(_handle, rented.AsMemory(0, HeaderSize + cursor), offset, cancellationToken)
+                .WriteAllAsync(_handle, rented.AsMemory(0, written), offset, cancellationToken)
                 .ConfigureAwait(false);
 
-            _offset = offset + HeaderSize + cursor;
+            _offset = offset + written;
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(rented);
+        }
+    }
+
+    /// <summary>Encoded payload size of one batch record, excluding its header.</summary>
+    private static int PayloadSizeOf(ulong firstSequence, IReadOnlyList<WriteOp> operations)
+    {
+        int size = Varint.SizeOf(firstSequence) + Varint.SizeOf((uint)operations.Count);
+
+        foreach (var op in operations)
+        {
+            size += 1 + Varint.SizeOf((uint)op.Key.Length) + op.Key.Length;
+            if (!op.IsDelete)
+            {
+                size += Varint.SizeOf((uint)op.Value!.Length) + op.Value.Length;
+            }
+        }
+
+        return size;
+    }
+
+    /// <summary>Writes one complete record and returns its total length.</summary>
+    private static int EncodeRecord(
+        Span<byte> destination,
+        ulong firstSequence,
+        IReadOnlyList<WriteOp> operations)
+    {
+        var payload = destination[HeaderSize..];
+        int cursor = 0;
+
+        cursor += Varint.Write(payload[cursor..], firstSequence);
+        cursor += Varint.Write(payload[cursor..], (uint)operations.Count);
+
+        foreach (var op in operations)
+        {
+            payload[cursor++] = (byte)(op.IsDelete ? ValueKind.Deletion : ValueKind.Value);
+            cursor += Varint.Write(payload[cursor..], (uint)op.Key.Length);
+            op.Key.CopyTo(payload[cursor..]);
+            cursor += op.Key.Length;
+
+            if (!op.IsDelete)
+            {
+                cursor += Varint.Write(payload[cursor..], (uint)op.Value!.Length);
+                op.Value.CopyTo(payload[cursor..]);
+                cursor += op.Value.Length;
+            }
+        }
+
+        BinaryPrimitives.WriteUInt32LittleEndian(destination[4..], (uint)cursor);
+
+        // The checksum spans the length field as well as the payload, so a corrupt length cannot
+        // send the reader off to parse garbage.
+        uint crc = Crc32.HashToUInt32(destination[4..(HeaderSize + cursor)]);
+        BinaryPrimitives.WriteUInt32LittleEndian(destination, crc);
+
+        return HeaderSize + cursor;
+    }
+
+    /// <summary>
+    /// Appends several batches as separate records in a single write.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// This is the log-side half of group commit. Each batch keeps its own checksummed record,
+    /// so per-batch atomicity across recovery is unchanged — a torn record still loses exactly
+    /// one batch and never half of one. What changes is that the whole group leaves the process
+    /// in one <c>pwrite</c> and is made durable by one <c>fsync</c>, instead of one of each per
+    /// batch.
+    /// </para>
+    /// <para>
+    /// The measurement that motivated it: write throughput sat at roughly 49,000 ops/sec with
+    /// fsync disabled entirely, and client-side pipelining lifted it only to 49,000 from 40,000
+    /// while lifting reads from 59,000 to 281,000. Reads scaled with concurrency and writes did
+    /// not, which is the signature of a serialised path rather than a slow device — every writer
+    /// was taking the same lock and issuing its own syscall, so the lock <i>was</i> the queue and
+    /// no amount of client pipelining could widen it.
+    /// </para>
+    /// </remarks>
+    internal async ValueTask AppendGroupAsync(
+        IReadOnlyList<(ulong FirstSequence, IReadOnlyList<WriteOp> Operations)> group,
+        CancellationToken cancellationToken = default)
+    {
+        if (group.Count == 0) return;
+        if (group.Count == 1)
+        {
+            await AppendAsync(group[0].FirstSequence, group[0].Operations, cancellationToken)
+                .ConfigureAwait(false);
+            return;
+        }
+
+        int total = 0;
+        foreach (var (firstSequence, operations) in group)
+        {
+            total += HeaderSize + PayloadSizeOf(firstSequence, operations);
+        }
+
+        byte[] rented = ArrayPool<byte>.Shared.Rent(total);
+        try
+        {
+            int cursor = 0;
+            foreach (var (firstSequence, operations) in group)
+            {
+                cursor += EncodeRecord(rented.AsSpan(cursor), firstSequence, operations);
+            }
+
+            long offset = _offset;
+            await PositionalIo
+                .WriteAllAsync(_handle, rented.AsMemory(0, cursor), offset, cancellationToken)
+                .ConfigureAwait(false);
+
+            // Advanced only after the write succeeds, so a failure leaves the log exactly as it
+            // was and the bytes that did land are simply overwritten by the next append.
+            _offset = offset + cursor;
         }
         finally
         {

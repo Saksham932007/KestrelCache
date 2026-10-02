@@ -1,0 +1,23 @@
+# Prometheus scrape configuration for the KestrelCache stack.
+global:
+  # Five seconds is deliberately tighter than the usual 15: the point of this stack is watching
+  # a benchmark run, and a benchmark that finishes in thirty seconds produces six samples at
+  # 5s and two at 15s. Rate() needs several points to say anything.
+  scrape_interval: 5s
+  evaluation_interval: 15s
+  external_labels:
+    stack: kestrelcache
+
+rule_files:
+  - /etc/prometheus/alerts.yml
+
+scrape_configs:
+  - job_name: kestrelcache
+    static_configs:
+      - targets: ["kestrelcache:9180"]
+        labels:
+          instance: kestrelcache
+
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]

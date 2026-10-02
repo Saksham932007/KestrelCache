@@ -831,6 +831,8 @@ public sealed class BitcaskEngine : IStorageEngine
             KeyCount = store.Index.Count,
             KeyCountIsExact = true,
             DiskSizeBytes = store.WriteOffset,
+            DataFileBytes = store.WriteOffset,
+            WriteAheadLogBytes = 0, // the append-only log is the data file
             LiveDataBytes = store.LiveBytes,
             Reads = Interlocked.Read(ref _reads),
             Writes = Interlocked.Read(ref _writes),
