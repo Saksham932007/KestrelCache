@@ -829,6 +829,7 @@ public sealed class BitcaskEngine : IStorageEngine
         {
             Engine = Name,
             KeyCount = store.Index.Count,
+            KeyCountIsExact = true,
             DiskSizeBytes = store.WriteOffset,
             LiveDataBytes = store.LiveBytes,
             Reads = Interlocked.Read(ref _reads),

@@ -14,7 +14,7 @@ internal static class Commands
         SyncPolicy = args.Enum("sync", SyncPolicy.Interval),
     };
 
-    private static EngineKind Engine(Args args) => args.Enum("engine", EngineKind.Bitcask);
+    private static EngineKind Engine(Args args) => args.Enum("engine", EngineKind.Lsm);
 
     private static ValueTask<KestrelDb> OpenAsync(Args args) =>
         KestrelDb.OpenAsync(BuildOptions(args), Engine(args));
@@ -79,7 +79,10 @@ internal static class Commands
         var stats = db.GetStats();
 
         Console.WriteLine($"engine                  {stats.Engine}");
-        Console.WriteLine($"keys                    {stats.KeyCount:N0}");
+        Console.WriteLine(
+            stats.KeyCountIsExact
+                ? $"live keys               {stats.KeyCount:N0}"
+                : $"entries (upper bound)   {stats.KeyCount:N0}  (counts stale versions and tombstones)");
         Console.WriteLine($"disk size               {Humanise(stats.DiskSizeBytes)}");
         Console.WriteLine($"live data               {Humanise(stats.LiveDataBytes)}");
         Console.WriteLine($"stale ratio             {stats.StaleRatio:P1}");
@@ -290,7 +293,8 @@ internal static class Commands
         Console.WriteLine();
         Console.WriteLine("5. Counters");
         var stats = db.GetStats();
-        Console.WriteLine($"   {stats.KeyCount} live key(s), {Humanise(stats.DiskSizeBytes)} on disk, "
+        string keyLabel = stats.KeyCountIsExact ? "live key(s)" : "entry(ies), stale versions included";
+        Console.WriteLine($"   {stats.KeyCount} {keyLabel}, {Humanise(stats.DiskSizeBytes)} on disk, "
             + $"{stats.Syncs} fsync(s)");
 
         Console.WriteLine();

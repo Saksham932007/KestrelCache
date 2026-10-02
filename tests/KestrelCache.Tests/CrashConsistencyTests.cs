@@ -41,27 +41,63 @@ public sealed class CrashConsistencyTests(ITestOutputHelper output)
         AutoCompactStaleRatio = 0,
     };
 
-    [Theory]
-    [InlineData(200)]
-    [InlineData(1_000)]
-    [InlineData(5_000)]
-    public async Task Every_acknowledged_write_survives_sigkill(int acknowledgementsBeforeKill)
+    private static DatabaseOptions LsmOptions(string path) => new()
     {
-        using var dir = new TempDirectory("crash");
+        Path = path,
+        SyncPolicy = SyncPolicy.None,
+        EnableBackgroundCompaction = false,
+        MemtableSizeBytes = 64 * 1024,
+        TargetFileSizeBytes = 256 * 1024,
+        BaseLevelSizeBytes = 512 * 1024,
+    };
+
+    /// <summary>Bitcask takes a file path; the LSM engine takes a directory.</summary>
+    private static string PathFor(EngineKind engine, TempDirectory dir) =>
+        engine == EngineKind.Bitcask ? dir.DbPath : dir.File("lsm");
+
+    private static async ValueTask<IStorageEngine> OpenAsync(EngineKind engine, string path) =>
+        engine == EngineKind.Bitcask
+            ? await BitcaskEngine.OpenAsync(ReadOptions(path))
+            : await Lsm.LsmEngine.OpenAsync(LsmOptions(path));
+
+    private static string DescribeRecovery(IStorageEngine engine) => engine switch
+    {
+        BitcaskEngine bitcask =>
+            $"{bitcask.Recovery.RecordsReplayed} record(s) replayed, "
+                + $"{bitcask.Recovery.BytesTruncated} byte(s) of torn tail discarded",
+        Lsm.LsmEngine lsm =>
+            $"{lsm.Recovery.LogsReplayed} log(s), {lsm.Recovery.EntriesReplayed} entry(ies) "
+                + $"replayed, {lsm.Recovery.BytesTruncated} torn byte(s), "
+                + $"{lsm.Recovery.OrphanTablesRemoved} orphan table(s) removed",
+        _ => "n/a",
+    };
+
+    [Theory]
+    [InlineData(EngineKind.Bitcask, 200)]
+    [InlineData(EngineKind.Bitcask, 1_000)]
+    [InlineData(EngineKind.Bitcask, 5_000)]
+    [InlineData(EngineKind.Lsm, 200)]
+    [InlineData(EngineKind.Lsm, 1_000)]
+    [InlineData(EngineKind.Lsm, 5_000)]
+    public async Task Every_acknowledged_write_survives_sigkill(
+        EngineKind engineKind,
+        int acknowledgementsBeforeKill)
+    {
+        using var dir = new TempDirectory($"crash-{engineKind}");
+        string path = PathFor(engineKind, dir);
 
         using var writer = await CrashWriterProcess.StartAsync(
-            dir.DbPath, EngineKind.Bitcask, SyncPolicy.EveryWrite, valueSize: ValueSize);
+            path, engineKind, SyncPolicy.EveryWrite, valueSize: ValueSize);
 
         await writer.WaitForAcknowledgementsAsync(
-            acknowledgementsBeforeKill, TimeSpan.FromSeconds(60));
+            acknowledgementsBeforeKill, TimeSpan.FromSeconds(120));
 
         var acknowledged = await writer.KillAsync();
-        output.WriteLine($"child acknowledged {acknowledged.Count} write(s) before SIGKILL");
-
-        await using var engine = await BitcaskEngine.OpenAsync(ReadOptions(dir.DbPath));
         output.WriteLine(
-            $"recovery: {engine.Recovery.RecordsReplayed} record(s) replayed, "
-                + $"{engine.Recovery.BytesTruncated} byte(s) of torn tail discarded");
+            $"{engineKind}: child acknowledged {acknowledged.Count} write(s) before SIGKILL");
+
+        await using var engine = await OpenAsync(engineKind, path);
+        output.WriteLine($"recovery: {DescribeRecovery(engine)}");
 
         foreach (string key in acknowledged)
         {
@@ -69,6 +105,87 @@ public sealed class CrashConsistencyTests(ITestOutputHelper output)
             Assert.NotNull(raw);
             Assert.Equal(DeterministicPayload.ValueFor(key, ValueSize), TestData.Text(raw));
         }
+    }
+
+    /// <summary>
+    /// The LSM engine has a second thing to get right that Bitcask does not: a crash can land
+    /// between writing an SSTable and installing the manifest that names it, or between
+    /// installing the manifest and deleting the log the data came from. Both must be survivable,
+    /// and neither may lose an acknowledged write.
+    /// </summary>
+    [Fact]
+    public async Task Repeated_lsm_crashes_never_lose_an_acknowledged_write()
+    {
+        using var dir = new TempDirectory("crash-lsm-rounds");
+        string path = PathFor(EngineKind.Lsm, dir);
+        var everAcknowledged = new HashSet<string>();
+
+        for (int round = 0; round < 5; round++)
+        {
+            using var writer = await CrashWriterProcess.StartAsync(
+                path, EngineKind.Lsm, SyncPolicy.EveryWrite, valueSize: ValueSize);
+
+            await writer.WaitForAcknowledgementsAsync(400, TimeSpan.FromSeconds(120));
+            var acknowledged = await writer.KillAsync();
+
+            foreach (string key in acknowledged) everAcknowledged.Add(key);
+
+            await using var engine = await Lsm.LsmEngine.OpenAsync(LsmOptions(path));
+
+            output.WriteLine(
+                $"round {round}: {acknowledged.Count} ack(s); recovery replayed "
+                    + $"{engine.Recovery.EntriesReplayed} entry(ies), discarded "
+                    + $"{engine.Recovery.BytesTruncated} torn byte(s) and "
+                    + $"{engine.Recovery.OrphanTablesRemoved} orphan table(s)");
+
+            // Everything acknowledged in any previous round must still be present: later rounds
+            // must not lose what earlier ones durably wrote.
+            foreach (string key in everAcknowledged)
+            {
+                byte[]? raw = await engine.GetAsync(TestData.Key(key));
+                Assert.NotNull(raw);
+                Assert.Equal(DeterministicPayload.ValueFor(key, ValueSize), TestData.Text(raw));
+            }
+        }
+    }
+
+    /// <summary>
+    /// After a crash, an ordered scan must agree with what point lookups report. A scan that
+    /// silently omits a recovered table would still pass every Get-based assertion above.
+    /// </summary>
+    [Fact]
+    public async Task A_scan_after_an_lsm_crash_agrees_with_point_lookups()
+    {
+        using var dir = new TempDirectory("crash-lsm-scan");
+        string path = PathFor(EngineKind.Lsm, dir);
+
+        using var writer = await CrashWriterProcess.StartAsync(
+            path, EngineKind.Lsm, SyncPolicy.EveryWrite, valueSize: ValueSize);
+
+        await writer.WaitForAcknowledgementsAsync(3_000, TimeSpan.FromSeconds(120));
+        var acknowledged = await writer.KillAsync();
+
+        await using var engine = await Lsm.LsmEngine.OpenAsync(LsmOptions(path));
+
+        var scanned = new List<string>();
+        await foreach (var (key, value) in engine.ScanAsync())
+        {
+            string text = TestData.Text(key)!;
+            scanned.Add(text);
+            Assert.Equal(DeterministicPayload.ValueFor(text, ValueSize), TestData.Text(value));
+        }
+
+        output.WriteLine(
+            $"{acknowledged.Count} ack(s), {scanned.Count} key(s) recovered and scannable");
+
+        foreach (string key in acknowledged)
+        {
+            Assert.Contains(key, scanned);
+        }
+
+        // Sorted, and no duplicates.
+        Assert.Equal(scanned.OrderBy(k => k, StringComparer.Ordinal), scanned);
+        Assert.Equal(scanned.Count, scanned.Distinct().Count());
     }
 
     /// <summary>

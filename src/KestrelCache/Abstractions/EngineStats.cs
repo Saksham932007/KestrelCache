@@ -8,8 +8,23 @@ public sealed record EngineStats
     /// <summary>Which engine produced these numbers.</summary>
     public required string Engine { get; init; }
 
-    /// <summary>Live keys currently visible to readers.</summary>
+    /// <summary>
+    /// Keys the engine is tracking. Exact only when <see cref="KeyCountIsExact"/> is true.
+    /// </summary>
+    /// <remarks>
+    /// The two engines genuinely cannot answer this question with the same precision, and
+    /// reporting an estimate as though it were a count would be worse than admitting the
+    /// difference. Bitcask holds every live key in a hash index, so its count is exact and free.
+    /// An LSM tree holds every <i>version</i> of every key, spread across a memtable and many
+    /// immutable tables, and it has no idea how many of them are superseded without merging them
+    /// — so its number is an upper bound that counts stale versions and tombstones too, and
+    /// drops toward the true figure as compaction proceeds. Getting an exact count means
+    /// scanning, which is what <c>ScanAsync</c> is for.
+    /// </remarks>
     public long KeyCount { get; init; }
+
+    /// <summary>Whether <see cref="KeyCount"/> is an exact live-key count or an upper bound.</summary>
+    public bool KeyCountIsExact { get; init; }
 
     /// <summary>Bytes occupied on disk by all files the engine owns.</summary>
     public long DiskSizeBytes { get; init; }

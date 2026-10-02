@@ -68,7 +68,7 @@ static void PrintUsage()
 
         COMMON OPTIONS
           --path PATH       Database file (bitcask) or directory (lsm). Default: ./kc-data
-          --engine NAME     bitcask | lsm. Default: bitcask
+          --engine NAME     bitcask | lsm. Default: lsm
           --sync POLICY     none | everywrite | interval. Default: interval
 
         EXAMPLES

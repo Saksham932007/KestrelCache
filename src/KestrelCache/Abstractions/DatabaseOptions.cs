@@ -49,8 +49,21 @@ public sealed record DatabaseOptions
     /// <summary>Size a memtable may reach before it is frozen and flushed to an SSTable (LSM only).</summary>
     public long MemtableSizeBytes { get; init; } = 4 * 1024 * 1024;
 
+    /// <summary>
+    /// Size a compaction output file is rolled at. Smaller files make each compaction cheaper and
+    /// more incremental; larger ones mean fewer files to track and fewer index blocks to hold
+    /// (LSM only).
+    /// </summary>
+    public long TargetFileSizeBytes { get; init; } = 8 * 1024 * 1024;
+
     /// <summary>Uncompressed size of an SSTable data block (LSM only).</summary>
     public int BlockSizeBytes { get; init; } = 4 * 1024;
+
+    /// <summary>
+    /// Whether SSTable data blocks are compressed. Blocks that do not shrink by at least an
+    /// eighth are stored verbatim regardless (LSM only).
+    /// </summary>
+    public bool CompressBlocks { get; init; } = true;
 
     /// <summary>Bits of Bloom filter per key. 10 bits gives a ~1% false-positive rate (LSM only).</summary>
     public int BloomBitsPerKey { get; init; } = 10;
@@ -80,6 +93,8 @@ public sealed record DatabaseOptions
             throw new ArgumentOutOfRangeException(nameof(MaxValueSize), "MaxValueSize cannot be negative.");
         if (MemtableSizeBytes <= 0)
             throw new ArgumentOutOfRangeException(nameof(MemtableSizeBytes), "MemtableSizeBytes must be positive.");
+        if (TargetFileSizeBytes <= 0)
+            throw new ArgumentOutOfRangeException(nameof(TargetFileSizeBytes), "TargetFileSizeBytes must be positive.");
         if (BlockSizeBytes <= 0)
             throw new ArgumentOutOfRangeException(nameof(BlockSizeBytes), "BlockSizeBytes must be positive.");
         if (BloomBitsPerKey < 0)

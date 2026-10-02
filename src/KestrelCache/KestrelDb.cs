@@ -22,20 +22,20 @@ public sealed class KestrelDb : IAsyncDisposable
     public IStorageEngine Engine => _engine;
 
     /// <summary>Opens a database at <paramref name="path"/> using the default engine.</summary>
-    public static ValueTask<KestrelDb> OpenAsync(string path, EngineKind engine = EngineKind.Bitcask) =>
+    public static ValueTask<KestrelDb> OpenAsync(string path, EngineKind engine = EngineKind.Lsm) =>
         OpenAsync(new DatabaseOptions { Path = path }, engine);
 
     /// <summary>Opens a database with explicit options.</summary>
     public static async ValueTask<KestrelDb> OpenAsync(
         DatabaseOptions options,
-        EngineKind engine = EngineKind.Bitcask)
+        EngineKind engine = EngineKind.Lsm)
     {
         ArgumentNullException.ThrowIfNull(options);
 
         IStorageEngine inner = engine switch
         {
             EngineKind.Bitcask => await BitcaskEngine.OpenAsync(options).ConfigureAwait(false),
-            EngineKind.Lsm => throw new NotSupportedException("The LSM engine arrives in phase 2."),
+            EngineKind.Lsm => await Lsm.LsmEngine.OpenAsync(options).ConfigureAwait(false),
             _ => throw new ArgumentOutOfRangeException(nameof(engine), engine, "Unknown engine."),
         };
 
