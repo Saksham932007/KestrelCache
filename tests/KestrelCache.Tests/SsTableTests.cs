@@ -326,6 +326,96 @@ public sealed class SsTableTests(ITestOutputHelper output)
             $"measured false-positive rate {measured:P2} is far above the predicted {expected:P2}");
     }
 
+    /// <summary>
+    /// Regression test for the key shape that the original Bloom hash handled badly.
+    /// </summary>
+    /// <remarks>
+    /// Dense zero-padded integers differing only in their final digits -- auto-increment ids,
+    /// timestamps, sequence numbers -- are among the most common real key shapes, and they were
+    /// the ones the LevelDB-style hash was worst at: it is affine in the key's trailing bytes, so
+    /// an arithmetic sequence of keys produced an arithmetic sequence of hashes that collapsed
+    /// onto far too few distinct values. The measured false-positive rate was 14% against a
+    /// predicted 0.8%, and raising the filter to 16 bits per key barely moved it, which is the
+    /// signature of collisions rather than of an undersized filter.
+    ///
+    /// The two separate shapes below matter: the original implementation passed comfortably on
+    /// distinct-prefix keys, which is why the first version of this test suite did not catch the
+    /// problem at all. A cross-engine benchmark did.
+    /// </remarks>
+    [Theory]
+    [InlineData(10, 0.02)]
+    [InlineData(16, 0.005)]
+    public void The_bloom_filter_handles_dense_numeric_keys(int bitsPerKey, double maximumRate)
+    {
+        const int keyCount = 100_000;
+
+        // Even keys present, odd keys probed: adjacent in value, nearly identical as bytes.
+        var keys = Enumerable.Range(0, keyCount)
+            .Select(i => ByteKey.From($"key:{i * 2:D12}"))
+            .ToArray();
+
+        byte[] filter = BloomFilter.Build(keys, bitsPerKey);
+
+        foreach (byte[] key in keys)
+        {
+            Assert.True(BloomFilter.MayContain(filter, key), "false negatives are never acceptable");
+        }
+
+        int falsePositives = 0;
+        for (int i = 0; i < keyCount; i++)
+        {
+            if (BloomFilter.MayContain(filter, ByteKey.From($"key:{(i * 2) + 1:D12}")))
+            {
+                falsePositives++;
+            }
+        }
+
+        double measured = (double)falsePositives / keyCount;
+        output.WriteLine(
+            $"dense numeric keys at {bitsPerKey} bits/key: measured {measured:P2}, "
+                + $"theory {BloomFilter.ExpectedFalsePositiveRate(bitsPerKey):P2}");
+
+        Assert.True(
+            measured < maximumRate,
+            $"false-positive rate {measured:P2} exceeds {maximumRate:P2} for dense numeric keys; "
+                + "the filter hash is colliding on arithmetically-spaced keys");
+    }
+
+    /// <summary>
+    /// Raising bits per key must actually lower the false-positive rate. A hash that collides
+    /// gives a rate that barely budges, so this is the assertion that would have caught the
+    /// original problem directly.
+    /// </summary>
+    [Fact]
+    public void More_bits_per_key_lowers_the_false_positive_rate()
+    {
+        const int keyCount = 50_000;
+
+        var keys = Enumerable.Range(0, keyCount)
+            .Select(i => ByteKey.From($"key:{i * 2:D12}"))
+            .ToArray();
+
+        double Measure(int bitsPerKey)
+        {
+            byte[] filter = BloomFilter.Build(keys, bitsPerKey);
+            int hits = 0;
+            for (int i = 0; i < keyCount; i++)
+            {
+                if (BloomFilter.MayContain(filter, ByteKey.From($"key:{(i * 2) + 1:D12}"))) hits++;
+            }
+            return (double)hits / keyCount;
+        }
+
+        double at6 = Measure(6);
+        double at10 = Measure(10);
+        double at16 = Measure(16);
+
+        output.WriteLine($"6 bits: {at6:P2}, 10 bits: {at10:P2}, 16 bits: {at16:P2}");
+
+        Assert.True(at10 < at6 / 2, $"10 bits ({at10:P2}) should roughly halve 6 bits ({at6:P2})");
+        Assert.True(at16 < at10 / 2, $"16 bits ({at16:P2}) should roughly halve 10 bits ({at10:P2})");
+    }
+
     [Fact]
     public async Task The_bloom_filter_rules_out_absent_keys_in_a_real_table()
     {

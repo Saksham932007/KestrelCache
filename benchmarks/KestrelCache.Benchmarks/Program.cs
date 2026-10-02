@@ -10,10 +10,14 @@ if (args.Length == 0 || args[0] is "-h" or "--help")
 
         USAGE
           kestrel-bench latency [--root DIR] [--ops N] [--value-size N]
+          kestrel-bench compare [--root DIR] [--ops N] [--value-size N]
           kestrel-bench micro   [BenchmarkDotNet filter...]
 
         latency   Real workloads against a real file, reporting p50/p95/p99/p99.9 per operation.
                   This is the suite whose numbers appear in the README.
+
+        compare   The same workloads through both engines, so each design trade-off is a
+                  measurement rather than a claim.
 
         micro     BenchmarkDotNet microbenchmarks of the hot paths (record encoding, index
                   lookup, allocation counts). Build in Release or BenchmarkDotNet will refuse.
@@ -33,7 +37,7 @@ if (args[0] == "micro")
     return 0;
 }
 
-if (args[0] != "latency")
+if (args[0] is not ("latency" or "compare"))
 {
     Console.Error.WriteLine($"error: unknown suite '{args[0]}'");
     return 2;
@@ -46,8 +50,13 @@ int valueSize = int.TryParse(ValueOf("--value-size"), out int parsedSize) ? pars
 
 Directory.CreateDirectory(root);
 
-var suite = new LatencySuite(root, operations, valueSize);
-await suite.RunAllAsync();
+if (args[0] == "compare")
+{
+    await new EngineComparison(root, operations, valueSize).RunAllAsync();
+    return 0;
+}
+
+await new LatencySuite(root, operations, valueSize).RunAllAsync();
 return 0;
 
 string? ValueOf(string name)

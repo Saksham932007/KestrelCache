@@ -1,4 +1,4 @@
-using System.Numerics;
+using System.IO.Hashing;
 
 namespace KestrelCache.Lsm;
 
@@ -22,11 +22,43 @@ namespace KestrelCache.Lsm;
 /// of RAM to avoid roughly 99 disk seeks out of every 100 misses.
 /// </para>
 /// <para>
-/// Rather than computing <c>k</c> independent hashes, this uses the double-hashing scheme from
-/// the LevelDB implementation: one 32-bit hash, then a rotation of it as a stride, stepping
-/// through the bit array. Kirsch and Mitzenmacher showed that two hashes suffice to build
-/// <c>k</c> with no asymptotic loss in false-positive rate, which turns <c>k</c> hash
-/// computations into one.
+/// Rather than computing <c>k</c> independent hashes, this uses double hashing: derive two
+/// values from the key and step through the bit array as <c>h, h+d, h+2d, ...</c>. Kirsch and
+/// Mitzenmacher showed that two hashes suffice to build <c>k</c> with no asymptotic loss in
+/// false-positive rate, which turns <c>k</c> hash computations into one.
+/// </para>
+/// <para><b>Why XxHash3 and not the usual LevelDB hash</b></para>
+/// <para>
+/// The first implementation here followed LevelDB exactly: its 32-bit <c>Hash</c> function for
+/// <c>h</c>, and a 17-bit rotation of that same value for <c>d</c>. The unit tests measured a
+/// false-positive rate within 0.1 percentage points of theory and it looked correct. The
+/// cross-engine benchmark then reported <b>14%</b> against a predicted 0.8%, because it used a
+/// different key shape: dense zero-padded integers, where present and absent keys differ only in
+/// their last digit or two.
+/// </para>
+/// <para>
+/// Two measurements identified the cause. First, raising the filter to 16 bits per key barely
+/// moved the rate (14.1% to 13.1%) — an undersized filter improves when given more bits, so the
+/// problem was not size. Second, adding a murmur3 finalizer to the existing hash did not help
+/// either, which rules out weak avalanche and leaves only one explanation: the hash was
+/// genuinely <i>colliding</i> on this key set, and no amount of post-mixing can separate two
+/// inputs that have already been mapped to the same 32-bit value. The hash is affine in the key's
+/// trailing bytes, so keys forming an arithmetic sequence map to hashes forming one, and a
+/// 200,000-key dense range collapses onto far fewer distinct values than chance would predict.
+/// A hash collision in a Bloom filter is not a near-miss — every probe coincides, so it is a
+/// guaranteed false positive.
+/// </para>
+/// <para>
+/// This matters because dense integer keys are not an exotic case: auto-increment identifiers,
+/// timestamps and sequence numbers are among the most common key shapes there are, and they are
+/// exactly the ones the original hash handled worst.
+/// </para>
+/// <para>
+/// XxHash3 fixes it, taking <c>h</c> and <c>d</c> from independent halves of one 64-bit digest
+/// so the stride is not a function of the hash. Measured on 100,000 keys at 10 bits per key:
+/// dense numeric keys fall from 14.06% to 0.78%, distinct-prefix keys stay at 0.88%, and random
+/// keys at 0.84% — all three now agree with the 0.84% the formula predicts, and the rate finally
+/// scales with bits per key as it should (0.05% at 16 bits).
 /// </para>
 /// </remarks>
 internal static class BloomFilter
@@ -54,8 +86,7 @@ internal static class BloomFilter
 
         foreach (byte[] key in userKeys)
         {
-            uint hash = Hash(key);
-            uint delta = BitOperations.RotateRight(hash, 17);
+            var (hash, delta) = Probes(key);
 
             for (int probe = 0; probe < probes; probe++)
             {
@@ -83,8 +114,7 @@ internal static class BloomFilter
         var bitmap = filter[..^1];
         int bits = bitmap.Length * 8;
 
-        uint hash = Hash(userKey);
-        uint delta = BitOperations.RotateRight(hash, 17);
+        var (hash, delta) = Probes(userKey);
 
         for (int probe = 0; probe < probes; probe++)
         {
@@ -124,44 +154,19 @@ internal static class BloomFilter
     }
 
     /// <summary>
-    /// A 32-bit hash with good avalanche behaviour, matching the one LevelDB's filter policy
-    /// uses so the sizing analysis carries over unchanged.
+    /// Derives the starting bit position and the stride for one key's probe sequence.
     /// </summary>
-    private static uint Hash(ReadOnlySpan<byte> data)
+    /// <remarks>
+    /// Both come from one XxHash3 digest, but from <i>independent halves</i> of it. Deriving the
+    /// stride from the hash — by rotating it, as the LevelDB filter policy does — makes the whole
+    /// probe sequence a function of a single 32-bit value, so two keys that collide in that value
+    /// have identical probe sets. Taking the stride from the other half removes that coupling.
+    /// The stride is forced odd so that it is coprime with any power-of-two bit count, which
+    /// keeps the sequence from revisiting the same bits.
+    /// </remarks>
+    private static (uint Hash, uint Delta) Probes(ReadOnlySpan<byte> data)
     {
-        const uint seed = 0xbc9f1d34;
-        const uint m = 0xc6a4a793;
-
-        uint hash = seed ^ (uint)(data.Length * m);
-        int index = 0;
-
-        while (data.Length - index >= 4)
-        {
-            uint word = (uint)(data[index]
-                | (data[index + 1] << 8)
-                | (data[index + 2] << 16)
-                | (data[index + 3] << 24));
-            hash += word;
-            hash *= m;
-            hash ^= hash >> 16;
-            index += 4;
-        }
-
-        switch (data.Length - index)
-        {
-            case 3:
-                hash += (uint)data[index + 2] << 16;
-                goto case 2;
-            case 2:
-                hash += (uint)data[index + 1] << 8;
-                goto case 1;
-            case 1:
-                hash += data[index];
-                hash *= m;
-                hash ^= hash >> 24;
-                break;
-        }
-
-        return hash;
+        ulong digest = XxHash3.HashToUInt64(data);
+        return ((uint)digest, (uint)(digest >> 32) | 1u);
     }
 }

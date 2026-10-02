@@ -112,8 +112,20 @@ internal sealed record ManifestState
 /// </remarks>
 internal static class Manifest
 {
-    /// <summary>Current manifest format version.</summary>
-    internal const int FormatVersion = 1;
+    /// <summary>
+    /// Current manifest format version.
+    /// </summary>
+    /// <remarks>
+    /// Bumped to 2 when the Bloom filter's hash changed from the LevelDB one to XxHash3 (see
+    /// <see cref="BloomFilter"/>). Nothing about the file <i>layout</i> changed, which is exactly
+    /// why the bump is necessary: an old table's filter bits were set by the old hash, so probing
+    /// it with the new one yields false <i>negatives</i> — the filter would report a key as
+    /// definitely absent when it is present, and the read would silently return nothing. A false
+    /// negative is the one failure a Bloom filter must never produce, so refusing to open an old
+    /// database is the only safe response. The manifest is the only way to reach a table, so
+    /// gating it here is sufficient.
+    /// </remarks>
+    internal const int FormatVersion = 2;
 
     /// <summary>Name of the manifest file within the database directory.</summary>
     internal const string FileName = "MANIFEST";
