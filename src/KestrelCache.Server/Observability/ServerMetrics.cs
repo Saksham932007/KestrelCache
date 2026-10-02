@@ -115,11 +115,13 @@ internal sealed class ServerMetrics
                 .Append('\n');
         }
 
-        void Gauge(string name, string help, double value)
+        void Gauge(string name, string help, double value, string? labels = null)
         {
             text.Append("# HELP ").Append(name).Append(' ').Append(help).Append('\n');
             text.Append("# TYPE ").Append(name).Append(" gauge\n");
-            text.Append(name).Append(' ')
+            text.Append(name);
+            if (labels is not null) text.Append('{').Append(labels).Append('}');
+            text.Append(' ')
                 .Append(value.ToString("G17", CultureInfo.InvariantCulture))
                 .Append('\n');
         }
@@ -216,67 +218,81 @@ internal sealed class ServerMetrics
         // ---- consensus
         if (raft is not null)
         {
-            Gauge("kestrelcache_raft_enabled", "1 when this node is part of a Raft cluster.", 1);
-            Gauge(
+            // Every consensus series is per-node, and the node id is what an operator reasons
+            // in: "n3 keeps campaigning" is actionable where "127.0.0.1:9193 keeps campaigning"
+            // has to be looked up first. Scrape-target labels cannot supply it, because the
+            // address a node is scraped on has nothing to do with the id it votes under.
+            string node = "node=\"" + raft.NodeId + "\"";
+            void RaftGauge(string name, string help, double value) => Gauge(name, help, value, node);
+            void RaftCounter(string name, string help, double value) => Counter(name, help, value, node);
+
+            RaftGauge("kestrelcache_raft_enabled", "1 when this node is part of a Raft cluster.", 1);
+            RaftGauge(
                 "kestrelcache_raft_is_leader",
                 "1 when this node currently accepts writes.",
                 raft.Role == KestrelCache.Raft.RaftRole.Leader ? 1 : 0);
-            Gauge("kestrelcache_raft_term", "The term this node believes it is in.", raft.Term);
-            Gauge("kestrelcache_raft_commit_index", "Highest committed log index.", raft.CommitIndex);
-            Gauge("kestrelcache_raft_last_applied", "Highest index applied to the state machine.", raft.LastApplied);
-            Gauge("kestrelcache_raft_log_last_index", "Index of the last log entry.", raft.LastLogIndex);
+            RaftGauge("kestrelcache_raft_term", "The term this node believes it is in.", raft.Term);
+            RaftGauge("kestrelcache_raft_commit_index", "Highest committed log index.", raft.CommitIndex);
+            RaftGauge("kestrelcache_raft_last_applied", "Highest index applied to the state machine.", raft.LastApplied);
+            RaftGauge("kestrelcache_raft_log_last_index", "Index of the last log entry.", raft.LastLogIndex);
 
             // The log's live range is what makes snapshotting visible. A first index above 1
             // means the prefix has been folded into a snapshot, and the gap between first and
             // last is what a restart actually has to replay.
-            Gauge("kestrelcache_raft_log_first_index", "Lowest index still held as a log entry.", raft.FirstLogIndex);
-            Gauge("kestrelcache_raft_log_entries", "Entries the log holds.", raft.LogEntryCount);
-            Gauge("kestrelcache_raft_log_bytes", "Bytes the Raft log occupies.", raft.LogSizeBytes);
-            Gauge("kestrelcache_raft_snapshot_index", "Last index covered by the snapshot.", raft.SnapshotIndex);
-            Gauge("kestrelcache_raft_snapshot_bytes", "Size of the snapshot file.", raft.SnapshotSizeBytes);
-            Counter("kestrelcache_raft_snapshots_taken_total", "Snapshots this node has taken.", raft.SnapshotsTaken);
-            Counter("kestrelcache_raft_snapshots_installed_total", "Snapshots received from a leader.", raft.SnapshotsInstalled);
-            Counter("kestrelcache_raft_snapshot_chunks_sent_total", "Snapshot chunks sent as leader.", raft.SnapshotChunksSent);
-            Counter("kestrelcache_raft_elections_started_total", "Elections this node has started.", raft.ElectionsStarted);
-            Counter("kestrelcache_raft_pre_votes_won_total", "Pre-vote rounds won, each becoming a real campaign.", raft.PreVotesWon);
+            RaftGauge("kestrelcache_raft_log_first_index", "Lowest index still held as a log entry.", raft.FirstLogIndex);
+            RaftGauge("kestrelcache_raft_log_entries", "Entries the log holds.", raft.LogEntryCount);
+            RaftGauge("kestrelcache_raft_log_bytes", "Bytes the Raft log occupies.", raft.LogSizeBytes);
+            RaftGauge("kestrelcache_raft_snapshot_index", "Last index covered by the snapshot.", raft.SnapshotIndex);
+            RaftGauge("kestrelcache_raft_snapshot_bytes", "Size of the snapshot file.", raft.SnapshotSizeBytes);
+            RaftCounter("kestrelcache_raft_snapshots_taken_total", "Snapshots this node has taken.", raft.SnapshotsTaken);
+            RaftCounter("kestrelcache_raft_snapshots_installed_total", "Snapshots received from a leader.", raft.SnapshotsInstalled);
+            RaftCounter("kestrelcache_raft_snapshot_chunks_sent_total", "Snapshot chunks sent as leader.", raft.SnapshotChunksSent);
+            RaftCounter("kestrelcache_raft_elections_started_total", "Elections this node has started.", raft.ElectionsStarted);
+            RaftCounter("kestrelcache_raft_pre_votes_won_total", "Pre-vote rounds won, each becoming a real campaign.", raft.PreVotesWon);
 
             // The useful one. Each lost pre-vote is an election that did not happen: the term was
             // never incremented and the rest of the cluster never had to react. A climbing count
             // means something keeps trying to campaign and cannot -- a flapping link, or a node
             // that does not know it was removed.
-            Counter("kestrelcache_raft_pre_votes_lost_total", "Pre-vote rounds lost, each an election avoided.", raft.PreVotesLost);
-            Counter("kestrelcache_raft_elections_won_total", "Elections this node has won.", raft.ElectionsWon);
-            Counter("kestrelcache_raft_membership_changes_total", "Membership changes completed.", raft.MembershipChanges);
+            RaftCounter("kestrelcache_raft_pre_votes_lost_total", "Pre-vote rounds lost, each an election avoided.", raft.PreVotesLost);
+            RaftCounter("kestrelcache_raft_elections_won_total", "Elections this node has won.", raft.ElectionsWon);
+            RaftCounter("kestrelcache_raft_membership_changes_total", "Membership changes completed.", raft.MembershipChanges);
 
             if (raft.Configuration is { } configuration)
             {
-                Gauge("kestrelcache_raft_voters", "Voters in the current configuration.", configuration.Voters.Count);
+                RaftGauge("kestrelcache_raft_voters", "Voters in the current configuration.", configuration.Voters.Count);
 
                 // Learners are replicated to but counted in no quorum, so they are tracked
                 // separately: a cluster of three voters and two learners tolerates one failure,
                 // not two.
-                Gauge("kestrelcache_raft_learners", "Non-voting members.", configuration.Learners.Count);
-                Gauge("kestrelcache_raft_quorum_size", "Votes needed for a decision.", configuration.QuorumSize);
+                RaftGauge("kestrelcache_raft_learners", "Non-voting members.", configuration.Learners.Count);
+                RaftGauge("kestrelcache_raft_quorum_size", "Votes needed for a decision.", configuration.QuorumSize);
 
                 // Worth alerting on: a change that never leaves the joint phase means the cluster
                 // permanently needs two majorities, so it tolerates fewer failures than either
                 // configuration alone.
-                Gauge(
+                RaftGauge(
                     "kestrelcache_raft_membership_change_in_progress",
                     "1 while a membership change is in its joint phase.",
                     configuration.IsJoint ? 1 : 0);
             }
 
             // Replication lag per follower is the clearest sign of a node falling behind far
-            // enough to need a state transfer rather than ordinary catch-up.
+            // enough to need a state transfer rather than ordinary catch-up. The role label
+            // matters for alerting: a voter falling behind costs failure tolerance, whereas a
+            // learner falling behind only delays a promotion, so the two deserve different
+            // thresholds and different severities.
             if (raft.MatchIndex.Count > 0)
             {
                 text.Append("# HELP kestrelcache_raft_peer_match_index Highest index each peer has acknowledged.\n");
                 text.Append("# TYPE kestrelcache_raft_peer_match_index gauge\n");
                 foreach (var (peer, matchIndex) in raft.MatchIndex.OrderBy(p => p.Key))
                 {
-                    text.Append("kestrelcache_raft_peer_match_index{peer=\"")
-                        .Append(peer).Append("\"} ").Append(matchIndex).Append('\n');
+                    string role = raft.Configuration?.IsLearner(peer) == true ? "learner" : "voter";
+                    text.Append("kestrelcache_raft_peer_match_index{").Append(node)
+                        .Append(",peer=\"").Append(peer)
+                        .Append("\",role=\"").Append(role).Append("\"} ")
+                        .Append(matchIndex).Append('\n');
                 }
             }
         }

@@ -8,6 +8,90 @@ something, the entry says what was broken and what revealed it.
 
 ---
 
+## Learner members and pre-vote — 2026-10-03
+
+Closes the two Raft gaps the previous release documented, and the two concurrency bugs the work
+uncovered on the way.
+
+**Learners.** A learner is replicated to and counted in nothing: no quorum, no votes, no
+campaigning. That last property matters — `IsVoter`, not `IsMember`, gates candidacy, because a
+learner that campaigned would increment terms it can never win with. And because a learner affects
+no majority, adding or removing one needs **no joint consensus phase at all**; a single
+configuration entry is safe.
+
+Which makes the two-step admission the cheap one. `CLUSTER ADDNODE` was always the wrong default:
+the newcomer counts toward quorums from the moment the entry is appended, so a three-node cluster
+admitting a fourth voter needs three of four before the fourth can answer anything — it tolerates
+*fewer* failures during the change than before it, for however long catch-up takes. With an empty
+log and a leader that has already snapshotted, that is a full state transfer. `ADDLEARNER` then
+`PROMOTE` narrows the window to a round trip.
+
+Verified on a live three-node cluster that had already discarded its log: n4 admitted as a learner
+(`voters:n1,n2,n3  learners:n4  quorum_size:2  learner_lag_n4:0`, its state arriving as a
+snapshot), promoted (`quorum_size:3`), then **n4 won term 2 after the leader was killed** and held
+it when the old leader came back.
+
+**Pre-vote.** A straw poll before any term is incremented: *would you vote for me?* A voter
+refuses if it has heard from a leader within its own election timeout, and a leader refuses because
+it knows of one — itself. Nothing is persisted and the voter's election timer is **not** reset,
+since a poll that quieted its own voters would become the disruption it exists to prevent.
+
+The A/B measurement, one node partitioned off while the cluster commits 25 entries, then rejoining:
+
+| | with pre-vote | without |
+| --- | --- | --- |
+| elections the rejoining node started | **0** | 3 |
+| cluster term | **1 → 1** | 1 → 5 |
+| leader | **unchanged** | changed |
+
+Three elections and a leadership change, caused by a node that could never have won any of them.
+
+New: `CLUSTER ADDLEARNER`, `CLUSTER PROMOTE`, learner fields and `quorum_size` on `CLUSTER INFO`,
+a `PreVote` option (on by default, and switchable mainly so the table above can be produced),
+pre-vote and learner metrics, four more alert rules, and four more Grafana panels. The
+configuration codec is at format version 2 and still reads version 1, so an existing cluster's
+persisted state loads unchanged.
+
+Two metrics bugs found while building the panels, both of which made an existing dashboard quietly
+useless rather than visibly broken:
+
+- No consensus metric carried a `node` label, although the dashboard legends and two alert
+  annotations were already written against `{{ node }}`. Every Raft legend and both annotations
+  rendered blank. All consensus series are now labelled with the node id — which is the right
+  identifier rather than the scrape address, because the address a node is scraped on has nothing
+  to do with the id it votes under.
+- `kestrelcache_raft_peer_match_index` did not distinguish a learner from a voter, so the
+  follower-lag alert averaged two things that mean different things: a voter lagging slows every
+  commit, while a learner lagging only delays its promotion. It now carries `role`, and the alert
+  is split into `VoterFallingBehind` and a `LearnerNotCatchingUp` that fires only when the lag is
+  large *and* not shrinking.
+
+Fixed, both the same shape — a file handle closed while another path still held it:
+
+- `HandleInstallSnapshotAsync` accumulated incoming chunks into a field touched entirely outside
+  any lock. A `FileStream` is not thread-safe, and a leader can have two `InstallSnapshot` RPCs in
+  flight at once — a retry from offset zero overlapping the chunk it assumed was lost — so two
+  writers raced one handle and `Complete()` flushed a stream the other call had already disposed.
+  Surfaced as an `ObjectDisposedException` in two full test runs out of eight.
+- `LsmEngine.InstallVersionAsync` retired the memtable *before* publishing the version that
+  replaced it, with a manifest fsync in between. Readers hold no lock, so a read landing in that
+  window found the data in neither place — a genuine read-availability hole, caught by a
+  background-maintenance test rather than by reading the code.
+
+And one in CI itself, which is the kind of bug that makes a green check mean nothing: the cluster
+job captured the leader's port once at startup and never refreshed it after deliberately killing
+that leader, so every later step — snapshotting, the runtime join, the removal — addressed a dead
+container. The failover step now publishes its replacement, and the removal step picks a victim
+that is neither the leader nor the node still down. A new step also asserts pre-vote end to end by
+restarting the killed node and checking that the cluster's term does not move.
+
+Also: every test whose correctness depends on elapsed time now runs serialised in one collection.
+They were being starved of CPU by the fuzzers and compaction sweeps and reporting absurdities —
+300 unsynced writes taking 7.1 s when they take 5 ms idle. Loosening the thresholds was the first
+instinct and the wrong one; the thresholds were right and the scheduling was wrong.
+
+Tests: 278 to 305.
+
 ## Raft log snapshotting and membership changes — 2026-10-02
 
 Closes the two largest gaps the previous release documented.

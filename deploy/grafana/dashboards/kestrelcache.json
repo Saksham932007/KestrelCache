@@ -1547,7 +1547,7 @@
       },
       "gridPos": {
         "h": 5,
-        "w": 4,
+        "w": 3,
         "x": 0,
         "y": 48
       },
@@ -1614,8 +1614,8 @@
       },
       "gridPos": {
         "h": 5,
-        "w": 4,
-        "x": 4,
+        "w": 3,
+        "x": 3,
         "y": 48
       },
       "fieldConfig": {
@@ -1670,15 +1670,15 @@
       "id": 26,
       "type": "stat",
       "title": "Voters",
-      "description": "Servers in the current configuration.",
+      "description": "Voting members of the current configuration. Learners are counted separately.",
       "datasource": {
         "type": "prometheus",
         "uid": "kestrelcache-prometheus"
       },
       "gridPos": {
         "h": 5,
-        "w": 4,
-        "x": 8,
+        "w": 3,
+        "x": 6,
         "y": 48
       },
       "fieldConfig": {
@@ -1730,6 +1730,132 @@
       ]
     },
     {
+      "id": 34,
+      "type": "stat",
+      "title": "Learners",
+      "description": "Non-voting members: replicated to, counted in no quorum. Normally a transient state on the way to a promotion.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "kestrelcache-prometheus"
+      },
+      "gridPos": {
+        "h": 5,
+        "w": 3,
+        "x": 9,
+        "y": 48
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "text"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "kestrelcache-prometheus"
+          },
+          "editorMode": "code",
+          "expr": "max(kestrelcache_raft_learners)",
+          "legendFormat": "learners",
+          "range": true,
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 35,
+      "type": "stat",
+      "title": "Quorum size",
+      "description": "Acknowledgements needed to commit. This, not the voter count, is what the cluster's failure tolerance is derived from -- and it is what rises the moment a learner is promoted.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "kestrelcache-prometheus"
+      },
+      "gridPos": {
+        "h": 5,
+        "w": 3,
+        "x": 12,
+        "y": 48
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "text"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "kestrelcache-prometheus"
+          },
+          "editorMode": "code",
+          "expr": "max(kestrelcache_raft_quorum_size)",
+          "legendFormat": "quorum",
+          "range": true,
+          "refId": "A"
+        }
+      ]
+    },
+    {
       "id": 27,
       "type": "stat",
       "title": "Membership change",
@@ -1740,8 +1866,8 @@
       },
       "gridPos": {
         "h": 5,
-        "w": 4,
-        "x": 12,
+        "w": 3,
+        "x": 15,
         "y": 48
       },
       "fieldConfig": {
@@ -1807,8 +1933,8 @@
       },
       "gridPos": {
         "h": 5,
-        "w": 4,
-        "x": 16,
+        "w": 3,
+        "x": 18,
         "y": 48
       },
       "fieldConfig": {
@@ -1870,8 +1996,8 @@
       },
       "gridPos": {
         "h": 5,
-        "w": 4,
-        "x": 20,
+        "w": 3,
+        "x": 21,
         "y": 48
       },
       "fieldConfig": {
@@ -2305,6 +2431,165 @@
           "refId": "C"
         }
       ]
+    },
+    {
+      "id": 36,
+      "type": "timeseries",
+      "title": "Pre-vote outcomes",
+      "description": "A lost pre-vote is an election that did not happen: the term was never incremented and no other node had to react, so this line going up is the mechanism working. What it reports is that some node repeatedly believes it should lead and the cluster disagrees -- a flapping link, or a node that does not know it was removed. Compare it against elections started on the left: with pre-vote on, that one should stay flat while this one absorbs the churn.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "kestrelcache-prometheus"
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 0,
+        "y": 68
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": true,
+            "axisSoftMin": 0,
+            "scaleDistribution": {
+              "type": "linear"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "kestrelcache-prometheus"
+          },
+          "editorMode": "code",
+          "expr": "increase(kestrelcache_raft_pre_votes_lost_total[$__rate_interval])",
+          "legendFormat": "{{node}} lost (election avoided)",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "kestrelcache-prometheus"
+          },
+          "editorMode": "code",
+          "expr": "increase(kestrelcache_raft_pre_votes_won_total[$__rate_interval])",
+          "legendFormat": "{{node}} won (became a campaign)",
+          "range": true,
+          "refId": "B"
+        }
+      ]
+    },
+    {
+      "id": 37,
+      "type": "timeseries",
+      "title": "Replication lag by role",
+      "description": "Entries each peer trails the leader's commit index by. The roles mean different things: a voter lagging slows every commit, because commitment waits on a quorum of acknowledgements, while a learner lagging only delays its promotion. A learner's lag should fall steadily after it is admitted -- a flat line means catch-up has stalled and promoting it would hand a vote to a node that cannot answer.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "kestrelcache-prometheus"
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 12,
+        "y": 68
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": true,
+            "axisSoftMin": 0,
+            "scaleDistribution": {
+              "type": "linear"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "kestrelcache-prometheus"
+          },
+          "editorMode": "code",
+          "expr": "max(kestrelcache_raft_commit_index) - on() group_right() kestrelcache_raft_peer_match_index",
+          "legendFormat": "{{peer}} ({{role}})",
+          "range": true,
+          "refId": "A"
+        }
+      ]
     }
   ],
   "preload": true,
@@ -2326,7 +2611,7 @@
   "timezone": "browser",
   "title": "KestrelCache",
   "uid": "kestrelcache-overview",
-  "version": 1,
+  "version": 2,
   "weekStart": "",
   "description": "Server throughput and tail latency on top, storage-engine internals in the middle, and replication at the bottom. The engine panels explain the latency panels; the Raft panels explain which node is answering at all."
 }

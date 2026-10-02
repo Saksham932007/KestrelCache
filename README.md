@@ -23,15 +23,16 @@ It speaks the Redis wire protocol, so `redis-cli` and `redis-benchmark` work aga
 | **Two storage engines** | A Bitcask-style append-only log with an in-memory hash index, and a log-structured merge tree with a write-ahead log, memtable, levelled SSTables, Bloom filters and a block cache. Both behind one interface, so their trade-offs are measured rather than asserted. |
 | **Real durability** | Three fsync policies with the cost of each measured, group commit to amortise it, and crash tests that `SIGKILL` a real process and verify every acknowledged write came back. |
 | **A server** | RESP over `System.IO.Pipelines`, verified against the genuine `redis-cli` and `redis-benchmark`. |
-| **Replication** | Raft — leader election, log replication, persistent state, log snapshotting, and membership changes through joint consensus. Nodes can be added and removed while the cluster runs. |
-| **Observability** | Prometheus metrics with a latency histogram and engine internals, a provisioned Grafana dashboard, and six alert rules. |
-| **278 tests** | Including a model-based fuzzer, single-bit-flip corruption sweeps, SIGKILL crash consistency, and a Raft Log Matching verifier run under up to 40% message loss. |
+| **Replication** | Raft — leader election with pre-vote, log replication, persistent state, log snapshotting, and membership changes through joint consensus. Nodes join as non-voting learners and are promoted once caught up, so growing the cluster never costs it failure tolerance. |
+| **Observability** | Prometheus metrics with a latency histogram and engine internals, a provisioned Grafana dashboard, and fourteen alert rules. |
+| **305 tests** | Including a model-based fuzzer, single-bit-flip corruption sweeps, SIGKILL crash consistency, and a Raft Log Matching verifier run under up to 40% message loss. |
 
 **The design documents are the interesting part** — why each decision was made, what was measured,
 which bugs the measurements found, and what is still missing:
 
 - **[docs/DESIGN.md](docs/DESIGN.md)** — storage engines, durability, concurrency, the server
-- **[docs/REPLICATION.md](docs/REPLICATION.md)** — Raft, log snapshotting, membership changes
+- **[docs/REPLICATION.md](docs/REPLICATION.md)** — Raft, log snapshotting, membership changes,
+  learners, pre-vote
 
 ---
 
@@ -161,7 +162,7 @@ src/KestrelCache.Server/       RESP server
 
 src/KestrelCache.Cli/          a CLI, and the crash-test harness
 
-tests/KestrelCache.Tests/      278 tests
+tests/KestrelCache.Tests/      305 tests
   Engines/                       engine behaviour, fuzzing, corruption, crashes
   Server/                        RESP protocol over a real socket
   Consensus/                     elections, replication, snapshots, membership
@@ -226,16 +227,34 @@ redis-cli -p 6381 cluster snapshot
 kestrel-server --raft-id n4 --raft-join --raft-port 7384 --port 6384 --data ./d4 \
   --raft-peers n1=127.0.0.1:7381,n2=127.0.0.1:7382,n3=127.0.0.1:7383,n4=127.0.0.1:7384
 
-redis-cli -p 6381 cluster addnode n4 127.0.0.1:7384
+# Admit it as a learner: replicated to, but counted in no quorum. Because a learner
+# affects no majority, this needs no joint consensus phase -- one entry, and the
+# three voters still only need two votes.
+redis-cli -p 6381 cluster addlearner n4 127.0.0.1:7384
+redis-cli -p 6381 cluster info | grep -E 'voters|learner|quorum'
+# -> voters:n1,n2,n3   learners:n4   quorum_size:2   learner_lag_n4:0
+
 redis-cli -p 6384 get key:150     # a key written before n4 existed; arrived via the snapshot
+
+# Promote once the lag is zero. This one is a joint change, but it is made against a
+# node that is already current, so the window where the cluster needs 3 of 4 is a
+# round trip rather than a whole state transfer.
+redis-cli -p 6381 cluster promote n4
+# -> voters:n1,n2,n3,n4   learners:   quorum_size:3
 
 redis-cli -p 6381 cluster removenode n2
 ```
 
-A node added at runtime, whose entire state arrived as a snapshot because the leader had already
-discarded its log, goes on to win an election and serve writes under the new membership. That
-exchange is reproduced verbatim in
-[docs/REPLICATION.md](docs/REPLICATION.md#verified-on-a-real-cluster-1).
+Admitting a voter directly is also supported (`cluster addnode`), and is the wrong default: the
+newcomer counts toward quorums from the moment the entry is appended, so until it has caught up
+the cluster tolerates *fewer* failures than before the change. With an empty log and a leader that
+has already snapshotted, catching up means a full state transfer. The two-step sequence above
+narrows that window to a round trip, which is the entire reason learners exist.
+
+A node admitted at runtime, whose entire state arrived as a snapshot because the leader had already
+discarded its log, goes on to win an election and serve writes under the new membership — the
+promoted learner n4 took term 2 after the leader was killed. That exchange is reproduced verbatim
+in [docs/REPLICATION.md](docs/REPLICATION.md#verified-on-a-real-cluster-1).
 
 ### Using it as a library
 
@@ -305,18 +324,18 @@ divergence it was looking for.
 ## Status and limitations
 
 Working and tested: both engines, durability policies, compaction, MVCC snapshots, ordered scans,
-the RESP server, Prometheus metrics, and Raft replication with failover, catch-up, log snapshotting
-and live membership changes.
+the RESP server, Prometheus metrics, and Raft replication with failover, catch-up, log snapshotting,
+pre-vote, learner members and live membership changes.
 
 Known gaps, stated plainly:
 
 - **Reads on a follower may be stale.** Read-your-writes holds against the leader; cluster-wide
-  linearizability would need ReadIndex.
-- **No pre-vote phase.** A partitioned node that rejoins can force a term increment and a needless
-  election.
-- **No learner members.** A joining server becomes a voter immediately, so it counts toward
-  quorums while still catching up. Real implementations promote a non-voting learner once it is
-  current.
+  linearizability would need ReadIndex. A learner makes a usable read replica for that reason —
+  it receives everything and can never be elected — but it is still a replica, not a snapshot
+  of the present.
+- **No leadership transfer.** A leader being decommissioned steps down and lets an election
+  happen rather than handing off to a specific successor, so there is a brief unavailable window
+  that a transfer would avoid.
 - **A replicated node must use the LSM engine.** Snapshotting requires enumerating the keyspace,
   which a hash index cannot do.
 - **No collection types and no `EXPIRE`.** The engine stores opaque bytes and no record carries a

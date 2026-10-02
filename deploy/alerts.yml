@@ -86,12 +86,29 @@ groups:
       - alert: RaftTermChurn
         # Terms climbing with no failures means something is repeatedly disrupting elections --
         # classically a removed server that does not know it was removed, or a flapping link.
+        # With pre-vote on, reaching this at all means the disruption survived the straw poll,
+        # so PreVoteChurn below should have fired first and is the better place to look.
         expr: increase(kestrelcache_raft_elections_started_total[10m]) > 10
         for: 10m
         labels:
           severity: warning
         annotations:
           summary: "{{ $labels.node }} has started {{ $value }} elections in ten minutes"
+
+      - alert: PreVoteChurn
+        # The early warning for the same class of fault, and the quieter one. A lost pre-vote is
+        # not itself a problem -- it is an election that correctly did not happen -- so this is
+        # deliberately not critical. What it means is that some node repeatedly believes it should
+        # lead and the cluster repeatedly disagrees: a flapping link, a node whose clock or
+        # timeouts are misconfigured, or one that does not know it was removed. Catching it here
+        # is strictly better than catching it as term churn, because at this stage nothing has
+        # been disrupted yet.
+        expr: increase(kestrelcache_raft_pre_votes_lost_total[10m]) > 20
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.node }} lost {{ $value }} pre-votes in ten minutes; it keeps trying to campaign and cannot"
 
       - alert: MembershipChangeStuck
         # A change that never leaves the joint phase leaves the cluster permanently requiring two
@@ -115,16 +132,38 @@ groups:
         annotations:
           summary: "The Raft log has {{ $value }} entries and no snapshot has been taken"
 
-      - alert: FollowerFallingBehind
-        # A follower whose acknowledged index trails the leader's commit index far enough will
-        # eventually need a full snapshot rather than incremental catch-up.
+      - alert: VoterFallingBehind
+        # A voter whose acknowledged index trails the leader's commit index far enough will
+        # eventually need a full snapshot rather than incremental catch-up. Restricted to voters
+        # because they are the ones whose lag costs something: a quorum is assembled from
+        # acknowledgements, so a slow voter slows every commit and a dead one costs the cluster
+        # its failure tolerance.
         expr: |
-          max(kestrelcache_raft_commit_index) - min(kestrelcache_raft_peer_match_index) > 10000
+          max(kestrelcache_raft_commit_index)
+          - min(kestrelcache_raft_peer_match_index{role="voter"}) > 10000
         for: 5m
         labels:
           severity: warning
         annotations:
-          summary: "A follower is {{ $value }} entries behind the leader"
+          summary: "A voter is {{ $value }} entries behind the leader"
+
+      - alert: LearnerNotCatchingUp
+        # A learner is meant to be a transient state on the way to becoming a voter. Lag alone is
+        # expected and is not worth waking anyone for -- that is the whole reason to admit a
+        # server as a learner first -- so this fires only when the lag is large and not shrinking,
+        # which means catch-up has stalled rather than being slow. A learner left in that state
+        # is replication traffic with no payoff, and promoting it anyway would hand a vote to a
+        # node that cannot answer.
+        expr: |
+          max(kestrelcache_raft_commit_index)
+          - min(kestrelcache_raft_peer_match_index{role="learner"}) > 10000
+          and
+          deriv(min(kestrelcache_raft_peer_match_index{role="learner"})[15m:1m]) <= 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "A learner is {{ $value }} entries behind and not catching up; promotion would be unsafe"
 
       - alert: NoCompactionProgress
         # Write-heavy but compaction has stopped: either it is wedged or it has failed, and
@@ -136,6 +175,5 @@ groups:
         for: 15m
         labels:
           severity: critical
-          
         annotations:
           summary: "Writes are flowing but no compaction has made progress in 15 minutes"
