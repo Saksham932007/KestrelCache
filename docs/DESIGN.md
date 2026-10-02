@@ -226,10 +226,20 @@ until the last handle closes. The name stays occupied by a file in "delete pendi
 rename still cannot land. The failure merely changes from `IOException` to
 `UnauthorizedAccessException`.
 
-What works is displacing rather than deleting. `File.Replace` renames the old log aside to
-`.superseded` — freeing the name at once, because renaming an open file is a different operation
-from unlinking one — and then renames the new log into place. Readers keep reading the old file
-under its new name, which is the same thing they were already doing with an unlinked inode.
+What works is displacing rather than deleting: rename the old log aside, then rename the new one
+into the name it vacated. Renaming frees the name at once, on Windows as on POSIX, because renaming
+an open file is not the same operation as unlinking one. Readers keep reading the old file under
+its new name, which is the same thing they were already doing with an unlinked inode.
+
+Two apparent shortcuts are not. `File.Replace` performs exactly this displacement internally, but
+it opens the destination for *writing*, and the log is deliberately shared for reading and deleting
+only; granting `FileShare.Write` to satisfy it would also let a second process open the same
+database and corrupt it, which is a worse trade than issuing the two renames directly. And the
+backup needs a fresh name each time rather than a fixed one: on Windows, deleting a file that
+readers still hold succeeds but only marks it delete-pending, and its directory entry survives
+until the last handle closes, so a fixed name would work once and then block every later compaction
+for as long as a single old-generation read was in flight — which is exactly what the concurrency
+tests generate. Numbering the backups removes the question instead of timing around it.
 
 The cost is that installing a compacted log is now two renames rather than one, so there is a
 window with no file at the canonical path, and that window is more dangerous than it looks:
@@ -237,9 +247,13 @@ opening a Bitcask log creates it on demand, so a crash lasting microseconds woul
 as an empty database and read as every key having been deleted at once. Startup therefore repairs
 the state explicitly, and rolls *back* — the compacted file was fsynced before the swap and
 rolling forward would also be sound, but the superseded log is the one the rest of the system
-already believed in, and abandoning the compaction costs only the work of redoing it. Both halves
-of the window are tested directly, including the case where the second rename did land and
-rolling back would wrongly resurrect deleted keys.
+already believed in, and abandoning the compaction costs only the work of redoing it. Because the
+backups are numbered, recovery restores the highest, which is the one that was live when the crash
+happened; a lower one belongs to a compaction that already succeeded, and restoring it would
+silently roll the database back across a completed swap and lose every write since. Three tests
+cover this: the interrupted swap, the case where the second rename did land and rolling back would
+wrongly resurrect deleted keys, and the ordering itself — generation 10 against generation 2, so
+that the comparison cannot quietly be lexicographic.
 
 The engine no longer depends on rename-over-open being atomic on any platform, which is the real
 improvement: the previous version was correct on POSIX by accident of the filesystem rather than by

@@ -34,9 +34,9 @@ public sealed class BitcaskEngineTests
             }
         }
 
-        // Exactly the state the first rename leaves behind: the live log parked under the backup
-        // name, and a complete replacement waiting under the temporary one.
-        string superseded = dir.DbPath + ".superseded";
+        // Exactly the state the first rename leaves behind: the live log parked under a numbered
+        // backup name, and a complete replacement waiting under the temporary one.
+        string superseded = dir.DbPath + ".superseded.1";
         string compacting = dir.DbPath + ".compacting";
         File.Move(dir.DbPath, superseded);
         File.WriteAllBytes(compacting, File.ReadAllBytes(superseded));
@@ -57,6 +57,38 @@ public sealed class BitcaskEngineTests
         Assert.False(File.Exists(compacting));
     }
 
+    // Backups are numbered, and recovery must restore the newest. Lower-numbered ones belong to
+    // compactions that completed and whose cleanup Windows refused while readers held them, so
+    // restoring one of those would roll the database back across a swap that had already
+    // succeeded -- losing every write made since, and silently.
+    [Fact]
+    public async Task Recovery_restores_the_newest_displaced_log_not_the_oldest()
+    {
+        using var dir = new TempDirectory();
+
+        // Three generations of the same key, left behind as numbered backups in order.
+        foreach (var (generation, value) in new[] { (1, "oldest"), (2, "middle"), (10, "newest") })
+        {
+            string backup = $"{dir.DbPath}.superseded.{generation}";
+            await using (var engine = await BitcaskEngine.OpenAsync(Options(backup)))
+            {
+                await engine.PutAsync(TestData.Key("k"), TestData.Value(value));
+            }
+        }
+
+        Assert.False(File.Exists(dir.DbPath));
+
+        await using var reopened = await BitcaskEngine.OpenAsync(Options(dir.DbPath));
+
+        // 10 beats 2, which means the comparison is numeric rather than lexicographic.
+        Assert.Equal("newest", TestData.Text(await reopened.GetAsync(TestData.Key("k"))));
+
+        // And the ones it passed over are swept, not left to be restored by a later open.
+        Assert.Empty(Directory.GetFiles(
+            Path.GetDirectoryName(Path.GetFullPath(dir.DbPath))!,
+            Path.GetFileName(dir.DbPath) + ".superseded.*"));
+    }
+
     // The other half of the window: the second rename landed, so the canonical path holds the
     // new log and the backup is merely litter. Recovery must leave the new log strictly alone --
     // rolling back here would discard a completed compaction and resurrect deleted keys.
@@ -74,7 +106,7 @@ public sealed class BitcaskEngineTests
         }
 
         // A plausible stale backup: an older generation that still contains the deleted key.
-        string superseded = dir.DbPath + ".superseded";
+        string superseded = dir.DbPath + ".superseded.1";
         await using (var stale = await BitcaskEngine.OpenAsync(Options(superseded)))
         {
             await stale.PutAsync(TestData.Key("keep"), TestData.Value("stale"));

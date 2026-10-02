@@ -112,17 +112,37 @@ public sealed class BitcaskEngine : IStorageEngine
     /// </remarks>
     private static void RecoverInterruptedCompaction(string path)
     {
-        string superseded = path + ".superseded";
-
-        if (!File.Exists(path) && File.Exists(superseded))
+        if (!File.Exists(path))
         {
-            File.Move(superseded, path);
+            // Backups are numbered in the order they were displaced, so the highest is the one
+            // that was live when the crash happened. Any lower ones belong to compactions that
+            // completed and whose cleanup was refused, and restoring one of those would roll the
+            // database back across a swap that had already succeeded.
+            string? newest = EnumerateSupersededLogs(path)
+                .Select(file => (File: file, Generation: GenerationOf(file)))
+                .Where(candidate => candidate.Generation >= 0)
+                .OrderByDescending(candidate => candidate.Generation)
+                .Select(candidate => candidate.File)
+                .FirstOrDefault();
+
+            if (newest is not null)
+            {
+                File.Move(newest, path);
+            }
         }
 
-        // Either leftover is dead weight once the log itself is settled: the backup belongs to a
-        // swap that completed, and the temporary to one that never got far enough to matter.
-        TryDelete(superseded);
+        // Both kinds of leftover are dead weight once the log itself is settled: a backup belongs
+        // to a swap that completed, and a temporary to one that never got far enough to matter.
+        SweepSupersededLogs(path);
         TryDelete(path + ".compacting");
+
+        static long GenerationOf(string file)
+        {
+            int dot = file.LastIndexOf('.');
+            return dot >= 0 && long.TryParse(file.AsSpan(dot + 1), out long generation)
+                ? generation
+                : -1;
+        }
     }
 
     private static void RestoreSupersededLog(string path, string supersededPath)
@@ -138,6 +158,39 @@ public sealed class BitcaskEngine : IStorageEngine
         {
             // The next open retries this through RecoverInterruptedCompaction, which is the path
             // that has to work anyway because a crash gets no chance to run this one at all.
+        }
+    }
+
+    private long _supersededCounter;
+
+    /// <summary>Deletes displaced logs, best effort, leaving <paramref name="keep"/> alone.</summary>
+    private static void SweepSupersededLogs(string path, string? keep = null)
+    {
+        foreach (string stale in EnumerateSupersededLogs(path))
+        {
+            if (!string.Equals(stale, keep, StringComparison.Ordinal))
+            {
+                TryDelete(stale);
+            }
+        }
+    }
+
+    private static IEnumerable<string> EnumerateSupersededLogs(string path)
+    {
+        string? directory = Path.GetDirectoryName(Path.GetFullPath(path));
+        if (string.IsNullOrEmpty(directory) || !Directory.Exists(directory))
+        {
+            return [];
+        }
+
+        try
+        {
+            return Directory.EnumerateFiles(
+                directory, Path.GetFileName(path) + ".superseded.*");
+        }
+        catch (IOException)
+        {
+            return [];
         }
     }
 
@@ -846,24 +899,47 @@ public sealed class BitcaskEngine : IStorageEngine
                 throw;
             }
 
-            string supersededPath = store.Path + ".superseded";
+            // A fresh name per compaction, never a fixed one. On Windows, deleting a file that
+            // readers still hold succeeds but only marks it delete-pending: the directory entry
+            // survives until the last handle closes, so the name remains visible and a later
+            // rename onto it fails. A fixed backup name would therefore work once and then block
+            // every subsequent compaction for as long as a single old-generation read was still
+            // in flight -- which is precisely the workload the concurrency tests generate. A
+            // unique name cannot collide, so the whole question disappears.
+            string supersededPath = $"{store.Path}.superseded.{Interlocked.Increment(ref _supersededCounter)}";
+
+            // Retry the deletes that earlier compactions were refused, now that their readers
+            // have probably drained. Nothing else ever revisits them inside a running process.
+            SweepSupersededLogs(store.Path, keep: supersededPath);
 
             try
             {
-                // File.Replace, not File.Move(overwrite: true), and the difference is entirely
-                // about Windows. Both files are still open here -- readers are mid-flight on the
-                // old one and the new one is about to become the live handle. POSIX renames over
-                // an open file without complaint, so File.Move was correct on Linux and macOS and
-                // failed every time on Windows: there, granting FileShare.Delete allows the old
-                // file to be *deleted* while open, but its directory entry survives until the
-                // last handle closes, so the name stays occupied and the rename cannot land.
+                // Two explicit renames, which is the only sequence that works on both platforms.
                 //
-                // Replace displaces instead of deleting. The old log is renamed aside to
-                // .superseded -- which frees the name immediately, on Windows as on POSIX,
-                // because renaming an open file is not the same operation as unlinking one -- and
-                // the new log is renamed into place. Readers holding the old handle keep reading
-                // it under its new name, exactly as they kept reading the unlinked inode before.
-                File.Replace(tempPath, store.Path, supersededPath);
+                // Both files are open here -- readers are mid-flight on the old one, and the new
+                // one is about to become the live handle. POSIX renames over an open file without
+                // complaint, so a single File.Move was correct on Linux and macOS and failed
+                // every time on Windows. Two things that look like fixes are not:
+                //
+                //   - FileShare.Delete alone. It lets Windows delete a file that has open
+                //     handles, but the directory entry survives until the last one closes, so
+                //     the name stays occupied by a delete-pending file and the rename still
+                //     cannot land. The failure changes from IOException to
+                //     UnauthorizedAccessException, which is not progress.
+                //   - File.Replace. ReplaceFile does exactly this displacement internally, but it
+                //     opens the destination for writing, and this log is deliberately shared for
+                //     reading and deleting only. Granting FileShare.Write would satisfy it and
+                //     would also let a second process open the same database and corrupt it,
+                //     which is a worse trade than doing the two renames by hand.
+                //
+                // Renaming needs only delete access, which FileShare.Delete already grants. So
+                // the old log is renamed aside -- freeing the name at once, on Windows as on
+                // POSIX, because renaming an open file is not the same operation as unlinking one
+                // -- and the new log is renamed into the name it vacated. Readers holding the old
+                // handle keep reading it under its new name, exactly as they kept reading an
+                // unlinked inode before.
+                File.Move(store.Path, supersededPath);
+                File.Move(tempPath, store.Path);
             }
             catch
             {

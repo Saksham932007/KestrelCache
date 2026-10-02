@@ -33,10 +33,17 @@ stays occupied by a delete-pending file and the rename still cannot land — the
 changes from `IOException` to `UnauthorizedAccessException`. **Windows has no equivalent of
 rename-over-open, and no combination of share flags provides one.**
 
-What works is displacing rather than deleting: `File.Replace` renames the old log aside to
-`.superseded`, which frees the name immediately because renaming an open file is a different
-operation from unlinking one, then renames the new log into place. Readers carry on against the
-old file under its new name, exactly as they did against an unlinked inode.
+What works is displacing rather than deleting: rename the old log aside, then rename the new one
+into the name it vacated. That frees the name immediately, because renaming an open file is a
+different operation from unlinking one, and readers carry on against the old file under its new
+name exactly as they did against an unlinked inode.
+
+`File.Replace` does this internally and still fails, because it opens the destination for writing
+while the log is shared for reading and deleting only — and granting `FileShare.Write` would let a
+second process open the same database and corrupt it. The backups are also numbered rather than
+sharing one name: on Windows a delete that readers block still succeeds but only marks the file
+delete-pending, its directory entry outliving the delete, so a fixed name would work once and then
+block every later compaction while any old-generation read was in flight.
 
 Installing a compacted log is therefore two renames now, and the window between them is more
 dangerous than it appears: opening a Bitcask log creates it on demand, so a crash lasting
@@ -44,8 +51,11 @@ microseconds would replay as an empty database and read as every key having been
 Startup repairs that state explicitly and rolls back rather than forward — the compacted file was
 fsynced before the swap, so rolling forward would be sound too, but the superseded log is the one
 the rest of the system already believed in and abandoning the compaction costs only the work of
-redoing it. Two new tests cover both halves of the window, including the case where the second
-rename did land and rolling back would wrongly resurrect deleted keys.
+redoing it. Recovery restores the highest-numbered backup, since a lower one belongs to a
+compaction that already succeeded and restoring it would roll the database back across a completed
+swap, silently losing every write since. Three new tests cover the interrupted swap, the case where
+the second rename did land and rolling back would wrongly resurrect deleted keys, and the ordering
+itself — generation 10 against generation 2, so the comparison cannot quietly be lexicographic.
 
 The engine no longer relies on rename-over-open being atomic on any platform, which is the part
 worth keeping: it was previously correct on POSIX by accident of the filesystem rather than by
