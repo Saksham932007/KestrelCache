@@ -1218,17 +1218,17 @@ public sealed class LsmEngine : IScannableStorageEngine
         {
             var mem = Volatile.Read(ref _mem);
 
-            if (retiredMemtable is not null)
-            {
-                var remaining = mem.Immutable.Where(m => !ReferenceEquals(m, retiredMemtable)).ToList();
-                Volatile.Write(ref _mem, new MemState(mem.Active, remaining));
-                mem = Volatile.Read(ref _mem);
-            }
+            // The surviving memtables once the flushed one is retired. Computed without mutating
+            // anything yet, because the retirement has to happen *after* the new version is
+            // published.
+            var remaining = retiredMemtable is null
+                ? mem.Immutable
+                : [.. mem.Immutable.Where(m => !ReferenceEquals(m, retiredMemtable))];
 
             // The oldest log still backing a live memtable. Everything below it has been
             // durably flushed into SSTables and is now redundant.
-            logNumber = mem.Immutable.Count > 0
-                ? mem.Immutable.Min(m => m.LogNumber)
+            logNumber = remaining.Count > 0
+                ? remaining.Min(m => m.LogNumber)
                 : mem.Active.LogNumber;
 
             Manifest.Save(
@@ -1240,6 +1240,21 @@ public sealed class LsmEngine : IScannableStorageEngine
             lock (_snapshotGate)
             {
                 _liveVersions.Add(updated);
+            }
+
+            // Retired only now, and this ordering is load-bearing. A reader does not hold the
+            // write lock: it reads _mem and then acquires the current version, as two separate
+            // steps. Dropping the memtable first therefore opened a window -- spanning a
+            // manifest write and its fsync, so milliseconds -- in which a reader could observe
+            // the memtable already gone and the SSTable not yet published, and a committed key
+            // would simply not be found.
+            //
+            // Doing it in this order means the worst a reader can see is both at once, which is
+            // harmless: the entries are identical and sequence numbers make the result the same
+            // either way.
+            if (retiredMemtable is not null)
+            {
+                Volatile.Write(ref _mem, new MemState(mem.Active, remaining));
             }
         }
         finally

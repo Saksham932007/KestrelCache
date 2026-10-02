@@ -17,6 +17,7 @@ namespace KestrelCache.Tests;
 /// that outlived the test. Without this, a build where every <c>Flush(true)</c> had quietly
 /// become <c>Flush()</c> would pass the entire rest of the suite.
 /// </remarks>
+[Collection(TimingSensitiveCollection.Name)]
 public sealed class DurabilityTests(ITestOutputHelper output)
 {
     private static DatabaseOptions Options(string path, SyncPolicy policy) => new()
@@ -77,8 +78,14 @@ public sealed class DurabilityTests(ITestOutputHelper output)
             await engine.PutAsync(TestData.Key($"k{i}"), TestData.Value("v"));
         }
 
-        // Wait long enough for the background loop to tick at least once more.
-        await Task.Delay(250);
+        // Polled rather than slept on. A fixed delay assumes the background loop gets scheduled
+        // within it, which on a loaded machine it sometimes does not -- and "0 fsyncs" then looks
+        // like a durability bug rather than a starved thread.
+        var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(10);
+        while (engine.GetStats().Syncs == 0 && DateTime.UtcNow < deadline)
+        {
+            await Task.Delay(25);
+        }
 
         long syncs = engine.GetStats().Syncs;
         output.WriteLine($"{writes} writes produced {syncs} fsync(s)");

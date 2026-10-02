@@ -14,7 +14,13 @@ namespace KestrelCache.Raft;
 /// </remarks>
 public static class RaftConfigurationCodec
 {
-    private const ushort FormatVersion = 1;
+    /// <summary>
+    /// Current format version. Version 1 had no learner list; it is still read, with an empty
+    /// one, so a log or snapshot written before learners existed still opens.
+    /// </summary>
+    private const ushort FormatVersion = 2;
+
+    private const ushort FormatVersionWithoutLearners = 1;
     private const int MaxVoters = 1024;
     private const int MaxIdLength = 256;
 
@@ -33,6 +39,7 @@ public static class RaftConfigurationCodec
         {
             WriteList(writer, configuration.OutgoingVoters);
         }
+        WriteList(writer, configuration.Learners);
 
         writer.Flush();
         return stream.ToArray();
@@ -47,11 +54,11 @@ public static class RaftConfigurationCodec
         }
 
         ushort version = BinaryPrimitives.ReadUInt16LittleEndian(encoded);
-        if (version != FormatVersion)
+        if (version is not (FormatVersion or FormatVersionWithoutLearners))
         {
             throw new CorruptRecordException(
                 $"Configuration format version {version} is not supported by this build "
-                    + $"(expected {FormatVersion}).",
+                    + $"(expected {FormatVersionWithoutLearners} or {FormatVersion}).",
                 0);
         }
 
@@ -63,12 +70,20 @@ public static class RaftConfigurationCodec
         bool hasOutgoing = reader.ReadBoolean();
         var outgoing = hasOutgoing ? ReadList(reader) : null;
 
+        // Absent in version 1, which predates learners.
+        var learners = version >= FormatVersion ? ReadList(reader) : [];
+
         if (voters.Count == 0)
         {
             throw new CorruptRecordException("Configuration contains no voters.", 0);
         }
 
-        return new RaftConfiguration { Voters = voters, OutgoingVoters = outgoing };
+        return new RaftConfiguration
+        {
+            Voters = voters,
+            OutgoingVoters = outgoing,
+            Learners = learners,
+        };
     }
 
     private static void WriteList(BinaryWriter writer, IReadOnlyList<string> values)

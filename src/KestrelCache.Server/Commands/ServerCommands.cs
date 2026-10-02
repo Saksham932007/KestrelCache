@@ -581,17 +581,36 @@ internal static class ServerCommands
                 text.Append("snapshots_installed:").Append(stats.SnapshotsInstalled).Append("\r\n");
                 text.Append("membership_changes:").Append(stats.MembershipChanges).Append("\r\n");
 
+                text.Append("pre_votes_won:").Append(stats.PreVotesWon).Append("\r\n");
+
+                // Each lost pre-vote is an election that was avoided: the term was never
+                // incremented and the rest of the cluster never had to react.
+                text.Append("pre_votes_lost:").Append(stats.PreVotesLost).Append("\r\n");
+
                 var configuration = stats.Configuration;
                 if (configuration is not null)
                 {
                     text.Append("voters:").Append(string.Join(',', configuration.Voters))
                         .Append("\r\n");
+                    text.Append("learners:").Append(string.Join(',', configuration.Learners))
+                        .Append("\r\n");
+                    text.Append("quorum_size:").Append(configuration.QuorumSize).Append("\r\n");
                     text.Append("membership_change_in_progress:")
                         .Append(configuration.IsJoint ? 1 : 0).Append("\r\n");
                     if (configuration.OutgoingVoters is not null)
                     {
                         text.Append("outgoing_voters:")
                             .Append(string.Join(',', configuration.OutgoingVoters)).Append("\r\n");
+                    }
+
+                    // A learner's lag is the number an operator needs before promoting it: a
+                    // learner still streaming a snapshot should not be made a voter, because
+                    // until it is current it is a quorum member that cannot answer.
+                    foreach (string learner in configuration.Learners)
+                    {
+                        long? lag = replicated.ReplicationLagOf(learner);
+                        text.Append("learner_lag_").Append(learner).Append(':')
+                            .Append(lag?.ToString() ?? "unknown").Append("\r\n");
                     }
                 }
 
@@ -656,6 +675,64 @@ internal static class ServerCommands
             case "ADDNODE":
                 RespWriter.WriteError(
                     context.Output, "ERR CLUSTER ADDNODE requires <node-id> <host:port>");
+                break;
+
+            case "ADDLEARNER" when context.ArgumentCount >= 3:
+            {
+                // The recommended way to grow a cluster. A learner is in no quorum, so admitting
+                // one needs no joint phase and costs the cluster nothing in fault tolerance while
+                // it catches up. Adding a voter outright makes the newcomer a quorum member while
+                // its log is still empty, which reduces fault tolerance for as long as the
+                // catch-up takes.
+                string nodeId = context.Text(2);
+                string endpoint = context.Text(3);
+
+                RaftPeerAddress address;
+                try
+                {
+                    address = RaftPeerAddress.Parse($"{nodeId}={endpoint}");
+                }
+                catch (FormatException exception)
+                {
+                    RespWriter.WriteError(context.Output, $"ERR {exception.Message}");
+                    break;
+                }
+
+                await replicated.AddLearnerAsync(address, context.CancellationToken)
+                    .ConfigureAwait(false);
+
+                RespWriter.WriteSimpleString(
+                    context.Output,
+                    $"added {nodeId} as a learner; it is replicated to but does not vote. "
+                        + "Watch CLUSTER INFO for learner_lag_"
+                        + nodeId
+                        + ", then CLUSTER PROMOTE "
+                        + nodeId);
+                break;
+            }
+
+            case "ADDLEARNER":
+                RespWriter.WriteError(
+                    context.Output, "ERR CLUSTER ADDLEARNER requires <node-id> <host:port>");
+                break;
+
+            case "PROMOTE" when context.ArgumentCount >= 2:
+            {
+                string nodeId = context.Text(2);
+                long? lag = replicated.ReplicationLagOf(nodeId);
+
+                await replicated.PromoteLearnerAsync(nodeId, context.CancellationToken)
+                    .ConfigureAwait(false);
+
+                RespWriter.WriteSimpleString(
+                    context.Output,
+                    $"promoted {nodeId} (lag was {lag?.ToString() ?? "unknown"}); voters are now "
+                        + string.Join(",", replicated.Node.Configuration.Voters));
+                break;
+            }
+
+            case "PROMOTE":
+                RespWriter.WriteError(context.Output, "ERR CLUSTER PROMOTE requires <node-id>");
                 break;
 
             case "REMOVENODE" when context.ArgumentCount >= 2:

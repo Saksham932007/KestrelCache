@@ -1,0 +1,15 @@
+{
+  "$schema": "https://xunit.net/schema/current/xunit.runner.schema.json",
+
+  "// parallelism": [
+    "Collections still run in parallel, but capped rather than one per hardware thread.",
+    "The suite is CPU-bound -- fuzzers, compaction, bit-flip sweeps -- and saturating every",
+    "core leaves no headroom for the tests that measure elapsed time, which then fail for",
+    "reasons that have nothing to do with the code. Two keeps the suite fast while leaving a",
+    "core free for whatever is being timed."
+  ],
+  "parallelizeTestCollections": true,
+  "maxParallelThreads": 2,
+
+  "longRunningTestSeconds": 60
+}

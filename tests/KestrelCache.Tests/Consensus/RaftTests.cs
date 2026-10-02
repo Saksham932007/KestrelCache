@@ -9,7 +9,7 @@ namespace KestrelCache.Tests;
 /// Tests for the consensus layer, driven over a simulated network so that partitions, message
 /// loss and leader failures are reproducible rather than hoped for.
 /// </summary>
-[Collection("raft-cluster")]
+[Collection(TimingSensitiveCollection.Name)]
 public sealed class RaftTests(ITestOutputHelper output)
 {
     private static byte[] Key(string s) => Encoding.UTF8.GetBytes(s);

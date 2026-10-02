@@ -60,6 +60,7 @@ public sealed class RaftLog : IAsyncDisposable
     private readonly List<long> _terms = [];
 
     private FileStream _stream;
+    private int _disposed;
     private long _writeOffset;
     private long _snapshotIndex;
     private long _snapshotTerm;
@@ -840,10 +841,28 @@ public sealed class RaftLog : IAsyncDisposable
     }
 
     /// <inheritdoc />
-    public ValueTask DisposeAsync()
+    /// <remarks>
+    /// Takes both locks before closing the handle, and is idempotent. Disposing the stream while
+    /// an append was still in flight — or while a reader was mid-<c>pread</c> — surfaced as an
+    /// <see cref="ObjectDisposedException"/> on the <c>SafeFileHandle</c>, which is an unhelpful
+    /// way to learn that teardown raced an operation. Draining first means it cannot.
+    /// </remarks>
+    public async ValueTask DisposeAsync()
     {
-        _stream.Dispose();
-        _appendLock.Dispose();
-        return ValueTask.CompletedTask;
+        if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
+
+        await _appendLock.WaitAsync().ConfigureAwait(false);
+        try
+        {
+            lock (_gate)
+            {
+                _stream.Dispose();
+            }
+        }
+        finally
+        {
+            _appendLock.Release();
+            _appendLock.Dispose();
+        }
     }
 }

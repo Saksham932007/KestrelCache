@@ -95,21 +95,55 @@ public readonly record struct RaftLogEntry(
 }
 
 /// <summary>A candidate's request for a vote.</summary>
-/// <param name="Term">The candidate's term.</param>
+/// <param name="Term">
+/// The term being voted in. For a pre-vote this is the term the candidate <i>would</i> use, which
+/// it has deliberately not yet entered.
+/// </param>
 /// <param name="CandidateId">Who is asking.</param>
 /// <param name="LastLogIndex">Index of the candidate's last log entry.</param>
 /// <param name="LastLogTerm">Term of the candidate's last log entry.</param>
+/// <param name="PreVote">
+/// True for a straw poll that changes nothing on the voter: no term advance, no recorded vote.
+/// </param>
+/// <remarks>
+/// <para><b>Why pre-vote exists</b></para>
+/// <para>
+/// Ordinary Raft has a disruption problem. A node that was partitioned off rejoins, times out
+/// because it has heard from no leader, increments its term and asks for votes. Every healthy
+/// node — including a perfectly good leader — sees the higher term, steps down, and the cluster
+/// holds an election it did not need. The rejoining node cannot win, because its log is behind,
+/// but it has still cost an election and a brief interruption to writes. A flapping link makes
+/// that happen repeatedly.
+/// </para>
+/// <para>
+/// A pre-vote is the same question asked without consequences: "would you vote for me at term
+/// N+1?" The voter answers without advancing its term or recording anything, and crucially
+/// refuses if it has heard from a leader recently. Only if a majority says yes does the candidate
+/// increment its term and run a real election. A node with a stale log, or one rejoining a
+/// healthy cluster, never gets that far — so it never disturbs anyone.
+/// </para>
+/// </remarks>
 public readonly record struct RequestVoteRequest(
     long Term,
     string CandidateId,
     long LastLogIndex,
-    long LastLogTerm);
+    long LastLogTerm,
+    bool PreVote = false);
 
 /// <summary>A reply to <see cref="RequestVoteRequest"/>.</summary>
 /// <param name="Term">The responder's term, so a stale candidate learns it is behind.</param>
 /// <param name="VoteGranted">Whether the vote was given.</param>
 /// <param name="VoterId">Who replied.</param>
-public readonly record struct RequestVoteResponse(long Term, bool VoteGranted, string VoterId);
+/// <param name="PreVote">
+/// Echoes the request's flag. Carried so a pre-vote reply that arrives late cannot be counted
+/// toward a real election, or the reverse — the two rounds have different meanings and mixing
+/// them would let a candidate win on straw-poll answers.
+/// </param>
+public readonly record struct RequestVoteResponse(
+    long Term,
+    bool VoteGranted,
+    string VoterId,
+    bool PreVote = false);
 
 /// <summary>A leader's replication or heartbeat message.</summary>
 /// <param name="Term">The leader's term.</param>

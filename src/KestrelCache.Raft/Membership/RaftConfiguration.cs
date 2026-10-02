@@ -44,6 +44,21 @@ namespace KestrelCache.Raft;
 /// votes under a configuration it has already superseded, which reopens the window the whole
 /// mechanism exists to close.
 /// </para>
+/// <para><b>Learners</b></para>
+/// <para>
+/// A learner is replicated to but counted in nothing. It never votes, never appears in a quorum,
+/// and never campaigns. That sounds like a half-member, and the point is exactly that: because a
+/// learner affects no majority, <i>adding or removing one needs no joint phase at all</i> — a
+/// single configuration entry is safe, because no quorum anywhere changes size.
+/// </para>
+/// <para>
+/// Which solves a real problem with adding a voter directly. A three-node cluster admitting a
+/// fourth voter immediately needs three of four rather than two of three, so until the newcomer
+/// has caught up the cluster tolerates <i>fewer</i> failures than it did before — and a newcomer
+/// with an empty log can take a long time to catch up, especially if it needs a whole snapshot
+/// transferred. Admitting it as a learner first costs nothing, and promotion is a joint change
+/// made when it is already current and can answer immediately.
+/// </para>
 /// </remarks>
 public sealed record RaftConfiguration
 {
@@ -56,14 +71,24 @@ public sealed record RaftConfiguration
     /// </summary>
     public IReadOnlyList<string>? OutgoingVoters { get; init; }
 
+    /// <summary>
+    /// Servers that are replicated to but counted in nothing: they never vote, never appear in a
+    /// quorum, and never campaign.
+    /// </summary>
+    public IReadOnlyList<string> Learners { get; init; } = [];
+
     /// <summary>True while a membership change is in flight.</summary>
     public bool IsJoint => OutgoingVoters is { Count: > 0 };
 
-    /// <summary>Every server that must be replicated to, across both configurations.</summary>
+    /// <summary>
+    /// Every server that must be replicated to: both halves of a joint configuration, plus the
+    /// learners.
+    /// </summary>
     public IReadOnlyList<string> AllServers =>
-        OutgoingVoters is null
-            ? Voters
-            : [.. Voters.Concat(OutgoingVoters).Distinct()];
+        [.. Voters
+            .Concat(OutgoingVoters ?? [])
+            .Concat(Learners)
+            .Distinct()];
 
     /// <summary>
     /// The configuration a server joining an existing cluster starts from: no voters, so it
@@ -80,7 +105,14 @@ public sealed record RaftConfiguration
         new() { Voters = [.. voters.Distinct()] };
 
     /// <summary>Begins a transition to <paramref name="newVoters"/>.</summary>
-    public RaftConfiguration BeginTransitionTo(IEnumerable<string> newVoters)
+    /// <param name="newVoters">The voter set to move to.</param>
+    /// <param name="newLearners">
+    /// The learner set to move to. Defaults to the current one, which is what a plain voter change
+    /// wants; a promotion passes the learner it is removing.
+    /// </param>
+    public RaftConfiguration BeginTransitionTo(
+        IEnumerable<string> newVoters,
+        IEnumerable<string>? newLearners = null)
     {
         if (IsJoint)
         {
@@ -96,7 +128,24 @@ public sealed record RaftConfiguration
                 "A configuration must contain at least one voter.", nameof(newVoters));
         }
 
-        return new RaftConfiguration { Voters = target, OutgoingVoters = Voters };
+        var learners = (newLearners ?? Learners).Distinct().ToArray();
+
+        // A server cannot be both. Promotion works by moving it from one list to the other, and
+        // leaving it in both would have it replicated to twice and counted inconsistently.
+        var overlap = target.Intersect(learners).ToArray();
+        if (overlap.Length > 0)
+        {
+            throw new ArgumentException(
+                $"These servers are listed as both voters and learners: {string.Join(", ", overlap)}.",
+                nameof(newLearners));
+        }
+
+        return new RaftConfiguration
+        {
+            Voters = target,
+            OutgoingVoters = Voters,
+            Learners = learners,
+        };
     }
 
     /// <summary>Completes a transition, leaving only the incoming voters.</summary>
@@ -107,12 +156,51 @@ public sealed record RaftConfiguration
             throw new InvalidOperationException("No membership change is in progress.");
         }
 
-        return new RaftConfiguration { Voters = Voters };
+        return new RaftConfiguration { Voters = Voters, Learners = Learners };
     }
 
-    /// <summary>Whether <paramref name="nodeId"/> may vote under this configuration.</summary>
-    public bool Contains(string nodeId) =>
+    /// <summary>
+    /// Adds a learner, which needs no joint phase because it changes no majority.
+    /// </summary>
+    public RaftConfiguration WithLearner(string nodeId)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(nodeId);
+
+        if (Voters.Contains(nodeId))
+        {
+            throw new InvalidOperationException(
+                $"'{nodeId}' is already a voter; demoting a voter to a learner changes a majority "
+                    + "and would need a joint configuration.");
+        }
+
+        if (Learners.Contains(nodeId)) return this;
+
+        return this with { Learners = [.. Learners, nodeId] };
+    }
+
+    /// <summary>Removes a learner, which likewise needs no joint phase.</summary>
+    public RaftConfiguration WithoutLearner(string nodeId)
+    {
+        if (!Learners.Contains(nodeId)) return this;
+        return this with { Learners = [.. Learners.Where(l => l != nodeId)] };
+    }
+
+    /// <summary>
+    /// Whether <paramref name="nodeId"/> may vote — in either half of a joint configuration.
+    /// </summary>
+    /// <remarks>
+    /// This is the predicate that decides whether a node may campaign, so a learner must answer
+    /// false: a learner that stood for election would increment terms it can never win with,
+    /// disrupting the cluster for no possible benefit.
+    /// </remarks>
+    public bool IsVoter(string nodeId) =>
         Voters.Contains(nodeId) || (OutgoingVoters?.Contains(nodeId) ?? false);
+
+    /// <summary>Whether <paramref name="nodeId"/> is a non-voting member.</summary>
+    public bool IsLearner(string nodeId) => Learners.Contains(nodeId);
+
+    /// <summary>Whether <paramref name="nodeId"/> is in the cluster at all, voting or not.</summary>
+    public bool IsMember(string nodeId) => IsVoter(nodeId) || IsLearner(nodeId);
 
     /// <summary>Whether <paramref name="nodeId"/> is a voter in the configuration being moved to.</summary>
     public bool ContainsIncoming(string nodeId) => Voters.Contains(nodeId);
@@ -157,8 +245,14 @@ public sealed record RaftConfiguration
     public int QuorumSize => (Voters.Count / 2) + 1;
 
     /// <inheritdoc />
-    public override string ToString() =>
-        IsJoint
+    public override string ToString()
+    {
+        string voters = IsJoint
             ? $"joint([{string.Join(",", OutgoingVoters!)}] -> [{string.Join(",", Voters)}])"
             : $"[{string.Join(",", Voters)}]";
+
+        return Learners.Count == 0
+            ? voters
+            : $"{voters}+learners[{string.Join(",", Learners)}]";
+    }
 }

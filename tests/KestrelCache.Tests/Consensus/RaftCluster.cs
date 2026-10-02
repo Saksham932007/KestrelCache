@@ -302,16 +302,3 @@ public sealed class RaftCluster : IAsyncDisposable
         _directory.Dispose();
     }
 }
-
-/// <summary>
-/// Cluster tests run one at a time.
-/// </summary>
-/// <remarks>
-/// They drive consensus against wall-clock election timeouts, so starving them of CPU makes a
-/// healthy leader look like a failed one and a tick budget run out for reasons that have nothing
-/// to do with the code. On a four-thread machine, running them alongside the rest of the suite
-/// produced failures that disappeared in isolation -- which is the worst kind of test, because it
-/// trains you to ignore it.
-/// </remarks>
-[CollectionDefinition("raft-cluster", DisableParallelization = true)]
-public sealed class RaftClusterCollection;

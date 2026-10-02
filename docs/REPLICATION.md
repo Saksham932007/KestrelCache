@@ -12,10 +12,11 @@ quoted was measured rather than estimated, on the machine described under
 1. [What replication adds, and where it sits](#1-what-replication-adds-and-where-it-sits)
 2. [Consensus](#2-consensus)
 3. [Log snapshotting](#3-log-snapshotting)
-4. [Membership changes](#4-membership-changes)
-5. [Testing consensus](#5-testing-consensus)
-6. [Bugs worth reading about](#6-bugs-worth-reading-about)
-7. [What replication does not guarantee](#what-replication-does-not-guarantee)
+4. [Membership changes, and learners](#4-membership-changes-and-learners)
+5. [Pre-vote](#5-pre-vote)
+6. [Testing consensus](#6-testing-consensus)
+7. [Bugs worth reading about](#7-bugs-worth-reading-about)
+8. [What replication does not guarantee](#what-replication-does-not-guarantee)
 
 ---
 
@@ -209,7 +210,7 @@ into a full state transfer for any follower that misses the window.
 
 ---
 
-## 4. Membership changes
+## 4. Membership changes, and learners
 
 ### Why this is not a configuration file edit
 
@@ -248,6 +249,50 @@ be forgotten at one of the call sites.
 Not when committed. This is the detail most likely to be got wrong, and it is not an
 optimisation: waiting for commitment would mean counting votes and replicas under a configuration
 the node had already superseded, which reopens the exact window joint consensus exists to close.
+
+### Learners: the cheap way to grow
+
+A learner is replicated to but counted in nothing. It never votes, never appears in a quorum, and
+never campaigns. That sounds like a half-member, and the point is exactly that: **because a learner
+affects no majority, adding or removing one needs no joint phase at all.** A single configuration
+entry is safe, because no quorum anywhere changes size.
+
+Which solves a real problem with adding a voter directly. A three-node cluster admitting a fourth
+voter immediately needs three of four rather than two of three, so until the newcomer has caught up
+the cluster tolerates *fewer* failures than it did before. And a newcomer with an empty log can
+take a long time to catch up — especially if a whole snapshot has to be transferred, which is
+exactly the case when the leader has already truncated its log.
+
+So the recommended sequence is two steps:
+
+```
+CLUSTER ADDLEARNER n4 host:7384     # single entry, no joint phase, quorum unchanged
+CLUSTER INFO | grep learner_lag     # watch it catch up
+CLUSTER PROMOTE n4                  # joint change, made when it is already current
+```
+
+Measured on a live cluster that had already snapshotted its whole log away:
+
+```
+after ADDLEARNER:   voters:n1,n2,n3   learners:n4   quorum_size:2   learner_lag_n4:0
+                    n4: role:follower  snapshots_installed:1  (its state arrived as a snapshot)
+after PROMOTE:      voters:n1,n2,n3,n4  learners:   quorum_size:3
+```
+
+The cost of the window is the difference between those two `quorum_size` values, and with the
+two-step sequence it lasts a round trip rather than a state transfer.
+
+A learner is also the right answer for a read replica that should never be able to lead — a
+follower in a different rack or region, say, where promoting it would be worse than failing over
+locally. It receives everything and participates in nothing.
+
+Two properties are asserted directly rather than assumed:
+
+- **Adding or removing a learner appends exactly one entry**, and the configuration is never
+  joint. A joint change appends two.
+- **A learner cut off from the cluster starts zero elections and its term does not move.** A
+  learner that campaigned would increment terms it can never win with, disrupting the cluster for
+  no possible benefit, so `IsVoter` — not `IsMember` — is the predicate that gates campaigning.
 
 ### A joining server starts with no voters
 
@@ -319,7 +364,59 @@ membership and serve writes.
 
 ---
 
-## 5. Testing consensus
+## 5. Pre-vote
+
+### The disruption
+
+Ordinary Raft has a problem that is nobody's bug and still costs availability. A node partitioned
+off rejoins, times out because it has heard from no leader, increments its term and asks for votes.
+Every healthy node — including a perfectly good leader — sees the higher term, steps down, and the
+cluster holds an election it did not need. The rejoining node cannot win, because its log is
+behind. It has still cost an election, and a flapping link makes that happen over and over.
+
+### The straw poll
+
+A pre-vote asks the same question without consequences: *would you vote for me at term N+1?* Three
+properties make it work, and all three are easy to get wrong:
+
+1. **Nothing is persisted and no term advances.** A pre-vote carrying a higher term must not make
+   the voter step down, or the straw poll would cause exactly the disruption it exists to avoid.
+2. **A recent leader is a refusal.** If the voter has heard from a leader within its own election
+   timeout, it believes a leader exists and says no. This is the clause that does the work: a
+   majority will all have heard from a healthy leader, so the candidate never reaches the real
+   round. A leader refuses too, because it knows a leader exists — itself.
+3. **The election timer is not reset.** Unlike granting a real vote, answering a straw poll must
+   not delay the voter's own candidacy — otherwise a node could keep every peer quiet just by
+   polling them.
+
+Only if a majority says yes does the candidate increment its term and run a real election. Quorum
+for the straw poll is asked of the configuration, so the joint rule applies to it as well — a
+pre-vote must not greenlight a campaign that cannot actually be won.
+
+### Measured both ways
+
+The option can be turned off, which is useful for exactly one thing: demonstrating what it
+prevents. The same scenario, a node partitioned off while the cluster commits 25 entries, then
+rejoining:
+
+| | with pre-vote | without |
+| --- | --- | --- |
+| elections the rejoining node started | **0** | 3 |
+| pre-vote rounds it lost | 2 | — |
+| cluster term | **1 → 1** | 1 → 5 |
+| leader | **unchanged** | changed |
+
+Three elections, four term increments and a leadership change, caused by a node that could never
+have won any of them. That is the whole case for the feature.
+
+One counter: a lost pre-vote is not a failure to be alarmed by. It is an election that did not
+happen, which is why `kestrelcache_raft_pre_votes_lost_total` is worth graphing — a climbing count
+means something keeps trying to campaign and cannot, which is a flapping link or a node that does
+not know it was removed.
+
+---
+
+## 6. Testing consensus
 
 The transport is behind an interface, and that is what makes any of this testable. Raft's
 interesting behaviour is entirely about coping with a network that loses, delays, reorders and
@@ -331,7 +428,7 @@ With an in-process network the test controls, a split-brain scenario is three li
 milliseconds, deterministically. A separate suite runs a cluster over real sockets so the wire
 format is exercised too, including a 512 KiB value that must be reassembled from several reads.
 
-69 consensus tests, covering:
+95 consensus tests, covering:
 
 - single-node and five-node elections, the election restriction, one-vote-per-term, and that terms
   never go backwards
@@ -343,15 +440,35 @@ format is exercised too, including a 512 KiB value that must be reassembled from
 - snapshot capture, truncation, recovery, chunked transfer, and refusal of a corrupt image
 - joint-consensus quorum rules, adding and removing servers, a leader removing itself, membership
   surviving both a restart and a snapshot, and a change that cannot commit without both majorities
+- learners: that they are replicated to without voting, that adding or removing one appends a
+  single entry, that one cut off from the cluster never campaigns, that one is not counted toward
+  a quorum, promotion, and learner membership surviving a restart and a snapshot
+- pre-vote: that a straw poll changes nothing on the voter, that a live leader refuses one, that a
+  leader refuses one for itself, that a stale log is refused, that replies are tagged so the two
+  rounds cannot be mixed, and the A/B measurement above
 
-Cluster tests run one at a time. They drive consensus against wall-clock election timeouts, so
-starving them of CPU makes a healthy leader look like a failed one. On a four-thread machine,
-running them alongside the rest of the suite produced failures that disappeared in isolation —
-which is the worst kind of test, because it trains you to ignore it.
+Every test whose correctness depends on elapsed time — the consensus suites and the durability
+suite — lives in one collection with parallelisation disabled, which in xUnit means it runs neither
+concurrently with itself nor alongside any other collection. The rest of the suite is CPU-bound
+(fuzzers, compaction, bit-flip sweeps, crash harnesses) and saturates every core; run together on a
+four-thread machine, the timing tests get starved and report absurdities — 300 unsynced writes
+taking 7.1 seconds when they take 5 milliseconds idle, or a background fsync loop that never ran.
+
+Loosening each threshold until it stopped failing was the wrong instinct, and it was the first
+thing I tried. The thresholds were right; the scheduling was wrong. Isolating them keeps the
+assertions tight enough to mean something — the fsync-cost test in particular only has value if it
+is allowed to actually measure an fsync.
+
+A related lesson from the pre-vote A/B test, which was racy for a subtler reason. The first version
+healed the partition and then waited to see whether the rejoining node disturbed anything. But a
+rejoining node usually receives a heartbeat before its own timer fires, so it never campaigns at
+all and the test measured nothing — passing or failing on which arrived first. The deterministic
+version makes the node attempt its campaign *while still partitioned*, where the outcome is
+decided by the mechanism rather than by a race.
 
 ---
 
-## 6. Bugs worth reading about
+## 7. Bugs worth reading about
 
 ### Three safety bugs one test found
 

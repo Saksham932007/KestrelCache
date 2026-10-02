@@ -58,6 +58,17 @@ public sealed record RaftOptions
     /// </remarks>
     public double ElectionTimeoutJitter { get; init; } = 1.0;
 
+    /// <summary>
+    /// Run a pre-vote straw poll before incrementing the term and standing for election.
+    /// </summary>
+    /// <remarks>
+    /// On by default, because the behaviour it prevents is strictly bad: a node rejoining after a
+    /// partition forcing a needless election on a healthy cluster. It can be turned off, which
+    /// is useful for exactly one thing — demonstrating the disruption it prevents, which the test
+    /// suite does.
+    /// </remarks>
+    public bool PreVote { get; init; } = true;
+
     /// <summary>Most entries one AppendEntries message will carry.</summary>
     public int MaxEntriesPerAppend { get; init; } = 256;
 

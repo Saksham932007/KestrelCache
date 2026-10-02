@@ -17,7 +17,7 @@ namespace KestrelCache.Tests;
 /// a cluster over genuine sockets on ephemeral ports, so every message is framed, checksummed,
 /// written, read and decoded.
 /// </remarks>
-[Collection("raft-tcp")]
+[Collection(TimingSensitiveCollection.Name)]
 public sealed class RaftTransportTests(ITestOutputHelper output)
 {
     private sealed record Node(
@@ -234,9 +234,30 @@ public sealed class RaftTransportTests(ITestOutputHelper output)
             await victim.Rpc.DisposeAsync();
             output.WriteLine($"took {victim.Id}'s listener down");
 
-            await leader.Store.WriteAsync(new WriteBatch().Put("quorum", "sufficient"));
-
             var survivors = nodes.Where(n => n.Id != victim.Id).ToList();
+
+            // Retried against whoever leads. Taking a listener down can trigger a brief election,
+            // and the point of this test is that a quorum keeps working -- not that leadership
+            // happens to stay put.
+            bool written = false;
+            for (int attempt = 0; attempt < 10 && !written; attempt++)
+            {
+                try
+                {
+                    var current = await WaitForLeaderAsync(survivors, TimeSpan.FromSeconds(10));
+                    Assert.NotNull(current);
+
+                    await current.Store.WriteAsync(new WriteBatch().Put("quorum", "sufficient"));
+                    leader = current;
+                    written = true;
+                }
+                catch (NotLeaderException)
+                {
+                    await Task.Delay(100);
+                }
+            }
+
+            Assert.True(written, "a majority could not commit a write with one peer unreachable");
 
             var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(15);
             while (DateTime.UtcNow < deadline
@@ -292,6 +313,3 @@ public sealed class RaftTransportTests(ITestOutputHelper output)
         Assert.Throws<FormatException>(() => RaftPeerAddress.Parse(text));
 }
 
-/// <summary>TCP cluster tests bind real sockets, so they run one at a time.</summary>
-[CollectionDefinition("raft-tcp", DisableParallelization = true)]
-public sealed class RaftTcpCollection;

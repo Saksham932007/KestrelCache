@@ -45,7 +45,13 @@ if (args.Length > 0 && args[0] is "-h" or "--help" or "help")
 
             kestrel-server --raft-id n4 --raft-join --raft-port 7384 --port 6384 --data ./d4 \
               --raft-peers n1=127.0.0.1:7381,n2=127.0.0.1:7382,n3=127.0.0.1:7383
-            redis-cli -p 6381 cluster addnode n4 127.0.0.1:7384
+            # Preferred: admit as a non-voting learner, then promote once it has caught up.
+            # A learner is in no quorum, so this costs nothing while it catches up, whereas
+            # adding a voter outright reduces fault tolerance until it is current.
+            redis-cli -p 6381 cluster addlearner n4 127.0.0.1:7384
+            redis-cli -p 6381 cluster info | grep learner_lag
+            redis-cli -p 6381 cluster promote n4
+
             redis-cli -p 6381 cluster snapshot        # truncate the log behind a snapshot
             redis-cli -p 6381 cluster removenode n4
 

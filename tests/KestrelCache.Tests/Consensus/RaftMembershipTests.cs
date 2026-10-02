@@ -15,7 +15,7 @@ namespace KestrelCache.Tests;
 /// be elected in the same term. The joint phase, which demands a majority of both sets, is what
 /// rules that out, and these tests exercise it rather than taking it on trust.
 /// </remarks>
-[Collection("raft-cluster")]
+[Collection(TimingSensitiveCollection.Name)]
 public sealed class RaftMembershipTests(ITestOutputHelper output)
 {
     private static byte[] Key(string s) => Encoding.UTF8.GetBytes(s);
@@ -240,11 +240,11 @@ public sealed class RaftMembershipTests(ITestOutputHelper output)
 
         await cluster.AddJoiningNodeAsync("n4");
         await DriveAsync(cluster, leader.Node.AddServerAsync("n4"));
-        await cluster.WaitForConfigurationAsync(["n1", "n2", "n3", "n4"], maxTicks: 1500);
+        await cluster.WaitForConfigurationAsync(["n1", "n2", "n3", "n4"], maxTicks: 2500);
 
         Assert.True(
             await cluster.TickUntilAsync(
-                () => cluster["n4"].Node.GetStats().SnapshotsInstalled > 0, maxTicks: 3000),
+                () => cluster["n4"].Node.GetStats().SnapshotsInstalled > 0, maxTicks: 5000),
             cluster.Describe());
 
         output.WriteLine(cluster.Describe());

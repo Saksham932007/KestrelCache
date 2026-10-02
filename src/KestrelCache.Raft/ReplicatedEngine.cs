@@ -82,6 +82,29 @@ public sealed class ReplicatedEngine : IScannableStorageEngine
         _directory?.RemovePeer(nodeId);
     }
 
+    /// <summary>
+    /// Adds a non-voting learner, registering its address first so it can be reached.
+    /// </summary>
+    /// <remarks>
+    /// The preferred way to grow a cluster. A learner is counted in no quorum, so admitting one
+    /// needs no joint phase and costs the cluster nothing in fault tolerance while it catches up.
+    /// Promote it with <see cref="PromoteLearnerAsync"/> once it is current.
+    /// </remarks>
+    public async Task AddLearnerAsync(
+        RaftPeerAddress address,
+        CancellationToken cancellationToken = default)
+    {
+        _directory?.AddPeer(address);
+        await _node.AddLearnerAsync(address.NodeId, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>Promotes a learner to a voter.</summary>
+    public Task PromoteLearnerAsync(string nodeId, CancellationToken cancellationToken = default) =>
+        _node.PromoteLearnerAsync(nodeId, cancellationToken);
+
+    /// <summary>How far behind this node a member is, in log entries, or null if not known.</summary>
+    public long? ReplicationLagOf(string nodeId) => _node.ReplicationLagOf(nodeId);
+
     /// <summary>Captures a snapshot and discards the log prefix it replaces.</summary>
     public Task<RaftSnapshotMetadata?> CreateSnapshotAsync(
         CancellationToken cancellationToken = default) =>

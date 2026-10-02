@@ -345,8 +345,10 @@ public sealed class CrashConsistencyTests(ITestOutputHelper output)
 }
 
 /// <summary>
-/// Crash tests spawn processes and are I/O bound, so they run one at a time rather than
-/// competing with each other for the disk.
+/// Crash tests spawn child processes and are I/O bound, so they run one at a time rather than
+/// competing with each other for the disk. Kept separate from the timing-sensitive collection
+/// because they assert on what survived, not on how long anything took, so being descheduled
+/// cannot make them wrong -- only slow.
 /// </summary>
 [CollectionDefinition("crash", DisableParallelization = true)]
 public sealed class CrashCollection;

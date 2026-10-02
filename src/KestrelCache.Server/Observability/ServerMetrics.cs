@@ -238,12 +238,25 @@ internal sealed class ServerMetrics
             Counter("kestrelcache_raft_snapshots_installed_total", "Snapshots received from a leader.", raft.SnapshotsInstalled);
             Counter("kestrelcache_raft_snapshot_chunks_sent_total", "Snapshot chunks sent as leader.", raft.SnapshotChunksSent);
             Counter("kestrelcache_raft_elections_started_total", "Elections this node has started.", raft.ElectionsStarted);
+            Counter("kestrelcache_raft_pre_votes_won_total", "Pre-vote rounds won, each becoming a real campaign.", raft.PreVotesWon);
+
+            // The useful one. Each lost pre-vote is an election that did not happen: the term was
+            // never incremented and the rest of the cluster never had to react. A climbing count
+            // means something keeps trying to campaign and cannot -- a flapping link, or a node
+            // that does not know it was removed.
+            Counter("kestrelcache_raft_pre_votes_lost_total", "Pre-vote rounds lost, each an election avoided.", raft.PreVotesLost);
             Counter("kestrelcache_raft_elections_won_total", "Elections this node has won.", raft.ElectionsWon);
             Counter("kestrelcache_raft_membership_changes_total", "Membership changes completed.", raft.MembershipChanges);
 
             if (raft.Configuration is { } configuration)
             {
                 Gauge("kestrelcache_raft_voters", "Voters in the current configuration.", configuration.Voters.Count);
+
+                // Learners are replicated to but counted in no quorum, so they are tracked
+                // separately: a cluster of three voters and two learners tolerates one failure,
+                // not two.
+                Gauge("kestrelcache_raft_learners", "Non-voting members.", configuration.Learners.Count);
+                Gauge("kestrelcache_raft_quorum_size", "Votes needed for a decision.", configuration.QuorumSize);
 
                 // Worth alerting on: a change that never leaves the joint phase means the cluster
                 // permanently needs two majorities, so it tolerates fewer failures than either

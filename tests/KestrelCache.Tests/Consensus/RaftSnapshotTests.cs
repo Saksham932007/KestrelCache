@@ -15,7 +15,7 @@ namespace KestrelCache.Tests;
 /// already discarded. Both halves need testing — the truncation, and the state transfer that
 /// covers the gap it opens.
 /// </remarks>
-[Collection("raft-cluster")]
+[Collection(TimingSensitiveCollection.Name)]
 public sealed class RaftSnapshotTests(ITestOutputHelper output)
 {
     private static byte[] Key(string s) => Encoding.UTF8.GetBytes(s);

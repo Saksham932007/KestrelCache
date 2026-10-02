@@ -101,7 +101,28 @@ public sealed class RaftNode : IAsyncDisposable
     private string? _leaderId;
     private long _commitIndex;
     private long _lastApplied;
-    private DateTime _lastHeardFromLeader = DateTime.UtcNow;
+    /// <summary>
+    /// When the election timer was last reset: by hearing from a leader, by granting a vote, or
+    /// by standing for election.
+    /// </summary>
+    private DateTime _electionTimerResetAt = DateTime.UtcNow;
+
+    /// <summary>
+    /// When a leader last contacted this node, which is a different question from the election
+    /// timer and must not share a field with it.
+    /// </summary>
+    /// <remarks>
+    /// Conflating the two broke pre-vote comprehensively, and the reason is worth recording.
+    /// Standing for election resets the election timer — it has to, or a failed campaign retries
+    /// immediately. But the pre-vote rule is "refuse if I believe a leader exists", and if that
+    /// reads the same field, then every node that has just campaigned reports a live leader to
+    /// everyone else. On a fresh cluster all nodes campaign, all refuse each other's straw polls,
+    /// and no election can ever start: 23 tests failed at once.
+    ///
+    /// Starts at <see cref="DateTime.MinValue"/> rather than now, so a cluster that has never had
+    /// a leader grants pre-votes immediately instead of waiting out one timeout first.
+    /// </remarks>
+    private DateTime _lastLeaderContact = DateTime.MinValue;
     private TimeSpan _currentElectionTimeout;
     private Task? _driver;
     private volatile bool _disposed;
@@ -134,12 +155,21 @@ public sealed class RaftNode : IAsyncDisposable
     private long _appendEntriesSent;
     private long _appendEntriesRejected;
     private long _entriesApplied;
+    private long _preVotesWon;
+    private long _preVotesLost;
     private long _snapshotsTaken;
     private long _snapshotsInstalled;
     private long _snapshotChunksSent;
     private long _membershipChanges;
 
     private int _snapshotInProgress;
+
+    // Chunk accumulation is serialized on its own mutex rather than on _mutex, because installing
+    // a completed snapshot reacquires _mutex to publish the new commit index and configuration.
+    // It needs to be serialized by something, though: a FileStream is not thread-safe, and a
+    // leader can have two InstallSnapshot RPCs in flight at once (a retry from offset zero
+    // overlapping the chunk it thought was lost), which raced two writers onto one handle.
+    private readonly SemaphoreSlim _snapshotReceiveMutex = new(1, 1);
     private IncomingSnapshot? _incoming;
 
     /// <summary>Creates a node. Call <see cref="StartAsync"/> to begin participating.</summary>
@@ -341,6 +371,8 @@ public sealed class RaftNode : IAsyncDisposable
                 SnapshotChunksSent = Interlocked.Read(ref _snapshotChunksSent),
                 MembershipChanges = Interlocked.Read(ref _membershipChanges),
                 Configuration = _configuration,
+                PreVotesWon = Interlocked.Read(ref _preVotesWon),
+                PreVotesLost = Interlocked.Read(ref _preVotesLost),
                 ElectionsStarted = Interlocked.Read(ref _electionsStarted),
                 ElectionsWon = Interlocked.Read(ref _electionsWon),
                 AppendEntriesSent = Interlocked.Read(ref _appendEntriesSent),
@@ -412,7 +444,7 @@ public sealed class RaftNode : IAsyncDisposable
         {
             role = _role;
             electionDue = role != RaftRole.Leader
-                && DateTime.UtcNow - _lastHeardFromLeader >= _currentElectionTimeout;
+                && DateTime.UtcNow - _electionTimerResetAt >= _currentElectionTimeout;
         }
         finally
         {
@@ -459,75 +491,187 @@ public sealed class RaftNode : IAsyncDisposable
     }
 
     /// <summary>
-    /// Becomes a candidate and campaigns for the next term.
+    /// Stands for election: a pre-vote straw poll, then — only if that succeeds — a real
+    /// campaign.
     /// </summary>
     private async Task StartElectionAsync(CancellationToken cancellationToken)
     {
-        long term;
+        long prospectiveTerm;
         long lastLogIndex;
         long lastLogTerm;
         RaftConfiguration configuration;
-        IReadOnlyList<string> peers;
+        IReadOnlyList<string> voters;
 
         await _mutex.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
             if (_role == RaftRole.Leader) return;
 
-            // A server that is not a voter under the active configuration must not campaign. Two
-            // cases reach here: a server joining a cluster, which starts with no configuration
-            // and is waiting to learn it, and a server that has been removed and has not yet
-            // been shut down. Neither can win, and both would disturb a healthy cluster by
-            // forcing term increments it has to react to.
-            if (!_configuration.Contains(_options.NodeId))
+            // A server that is not a voter must not campaign. Three cases reach here: a server
+            // joining a cluster, which has no configuration yet and is waiting to learn it; a
+            // learner, which is replicated to but counted in nothing; and a server that has been
+            // removed and not yet shut down. None can win, and all three would disturb a healthy
+            // cluster by forcing term increments it has to react to.
+            if (!_configuration.IsVoter(_options.NodeId))
             {
                 return;
             }
 
-            // Term increment, self-vote and the fsync all happen before a single message goes
-            // out. Campaigning first and persisting afterwards would let a crash mid-election
-            // leave the node able to vote again in the same term.
-            _state.AdvanceTerm(_state.CurrentTerm + 1);
-            _state.RecordVote(_options.NodeId);
-
-            _role = RaftRole.Candidate;
-            _leaderId = null;
-            _lastHeardFromLeader = DateTime.UtcNow;
-            _currentElectionTimeout = NextElectionTimeout();
-
-            term = _state.CurrentTerm;
+            prospectiveTerm = _state.CurrentTerm + 1;
             lastLogIndex = _log.LastIndex;
             lastLogTerm = _log.LastTerm;
             configuration = _configuration;
-            peers = PeersLocked();
 
-            Interlocked.Increment(ref _electionsStarted);
-            Trace(
-                $"became candidate in term {term} (log {lastLogIndex}@{lastLogTerm}, "
-                    + $"configuration {configuration})");
+            // Only voters are polled. A learner's answer would be discarded anyway, since quorum
+            // is asked of the configuration, so asking is pure round-trip cost.
+            voters = VotersToPollLocked();
+
+            // The timer is reset here, before any messages go out, so a failed round backs off
+            // instead of retrying immediately.
+            _electionTimerResetAt = DateTime.UtcNow;
+            _currentElectionTimeout = NextElectionTimeout();
         }
         finally
         {
             _mutex.Release();
         }
 
-        // A genuine single-node cluster is its own majority and needs no round trip. Reached
-        // only when this node is the sole voter, which the check above has already established.
-        if (peers.Count == 0)
+        // A genuine single-voter cluster is its own majority and needs neither round.
+        if (voters.Count == 0)
         {
-            await BecomeLeaderAsync(term, cancellationToken).ConfigureAwait(false);
+            await EnterCandidacyAsync(cancellationToken).ConfigureAwait(false);
+            await BecomeLeaderAsync(_state.CurrentTerm, cancellationToken).ConfigureAwait(false);
             return;
         }
 
-        var request = new RequestVoteRequest(term, _options.NodeId, lastLogIndex, lastLogTerm);
-        var voters = new HashSet<string>(StringComparer.Ordinal) { _options.NodeId };
+        if (_options.PreVote)
+        {
+            bool wouldWin = await CanvassAsync(
+                    new RequestVoteRequest(
+                        prospectiveTerm, _options.NodeId, lastLogIndex, lastLogTerm, PreVote: true),
+                    configuration,
+                    voters,
+                    cancellationToken)
+                .ConfigureAwait(false);
 
-        var ballots = peers
+            if (!wouldWin)
+            {
+                // No term was incremented and nothing was persisted, so a healthy cluster has
+                // not noticed this happened at all. That is the whole purpose.
+                Interlocked.Increment(ref _preVotesLost);
+                Trace($"pre-vote for term {prospectiveTerm} failed; staying a follower");
+                return;
+            }
+
+            Interlocked.Increment(ref _preVotesWon);
+        }
+
+        long term = await EnterCandidacyAsync(cancellationToken).ConfigureAwait(false);
+        if (term == 0) return; // leadership or the term moved on underneath us
+
+        IReadOnlyList<string> realVoters;
+        RaftConfiguration realConfiguration;
+
+        await _mutex.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            if (_role != RaftRole.Candidate || _state.CurrentTerm != term) return;
+            realConfiguration = _configuration;
+            realVoters = VotersToPollLocked();
+        }
+        finally
+        {
+            _mutex.Release();
+        }
+
+        bool won = await CanvassAsync(
+                new RequestVoteRequest(term, _options.NodeId, lastLogIndex, lastLogTerm),
+                realConfiguration,
+                realVoters,
+                cancellationToken)
+            .ConfigureAwait(false);
+
+        if (won)
+        {
+            await BecomeLeaderAsync(term, cancellationToken).ConfigureAwait(false);
+        }
+
+        // No majority. The randomised timeout means the retry will not collide with the other
+        // candidates' retries, which is what lets a split vote resolve instead of repeating.
+    }
+
+    /// <summary>
+    /// Increments the term, votes for itself, and becomes a candidate. Returns the new term, or
+    /// zero if the transition no longer applies.
+    /// </summary>
+    /// <remarks>
+    /// Separated from the campaign because with pre-vote enabled this is the step that is
+    /// <i>deferred</i>: everything here is destructive and visible to the rest of the cluster, so
+    /// it happens only once a straw poll says the campaign can be won.
+    /// </remarks>
+    private async Task<long> EnterCandidacyAsync(CancellationToken cancellationToken)
+    {
+        await _mutex.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            if (_role == RaftRole.Leader) return 0;
+            if (!_configuration.IsVoter(_options.NodeId)) return 0;
+
+            // Term increment, self-vote and the fsync all happen before a single vote request
+            // goes out. Campaigning first and persisting afterwards would let a crash
+            // mid-election leave the node able to vote again in the same term.
+            _state.AdvanceTerm(_state.CurrentTerm + 1);
+            _state.RecordVote(_options.NodeId);
+
+            _role = RaftRole.Candidate;
+            _leaderId = null;
+            _electionTimerResetAt = DateTime.UtcNow;
+            _currentElectionTimeout = NextElectionTimeout();
+
+            Interlocked.Increment(ref _electionsStarted);
+            Trace(
+                $"became candidate in term {_state.CurrentTerm} "
+                    + $"(log {_log.LastIndex}@{_log.LastTerm}, configuration {_configuration})");
+
+            return _state.CurrentTerm;
+        }
+        finally
+        {
+            _mutex.Release();
+        }
+    }
+
+    /// <summary>Voters other than this node, which are the only peers worth polling.</summary>
+    private IReadOnlyList<string> VotersToPollLocked() =>
+        [.. _configuration.Voters
+            .Concat(_configuration.OutgoingVoters ?? [])
+            .Distinct()
+            .Where(voter => voter != _options.NodeId)];
+
+    /// <summary>
+    /// Asks every voter for a vote and reports whether a quorum granted it.
+    /// </summary>
+    /// <remarks>
+    /// Shared by both rounds, because the counting rule is identical: votes are tallied as they
+    /// arrive and the result is decided the moment the configuration says a quorum has been
+    /// reached, rather than waiting for the slowest peer or a dead one. Quorum is asked of the
+    /// configuration so that the joint rule — a majority of both voter sets during a membership
+    /// change — applies to the pre-vote as well, which it must, or a straw poll could greenlight
+    /// a campaign that cannot actually be won.
+    /// </remarks>
+    private async Task<bool> CanvassAsync(
+        RequestVoteRequest request,
+        RaftConfiguration configuration,
+        IReadOnlyList<string> voters,
+        CancellationToken cancellationToken)
+    {
+        var granters = new HashSet<string>(StringComparer.Ordinal) { _options.NodeId };
+        if (configuration.HasQuorum(granters)) return true;
+
+        var ballots = voters
             .Select(peer => SolicitVoteAsync(peer, request, cancellationToken))
             .ToList();
 
-        // Votes are counted as they arrive, so the election completes as soon as a majority is
-        // reached rather than waiting for the slowest or a dead peer.
         while (ballots.Count > 0)
         {
             var finished = await Task.WhenAny(ballots).ConfigureAwait(false);
@@ -536,29 +680,34 @@ public sealed class RaftNode : IAsyncDisposable
             var (peer, response) = await finished.ConfigureAwait(false);
             if (response is null) continue;
 
-            if (response.Value.Term > term)
+            // A reply from the wrong round cannot be counted: the two rounds ask different
+            // questions, and a straw-poll answer must never decide a real election.
+            if (response.Value.PreVote != request.PreVote) continue;
+
+            if (response.Value.Term > request.Term
+                || (!request.PreVote && response.Value.Term > _state.CurrentTerm))
             {
-                await StepDownAsync(response.Value.Term, cancellationToken).ConfigureAwait(false);
-                return;
+                // Learning of a higher term ends a real campaign. During a pre-vote it means the
+                // straw poll has failed, and no term is advanced -- which is the point.
+                if (!request.PreVote)
+                {
+                    await StepDownAsync(response.Value.Term, cancellationToken)
+                        .ConfigureAwait(false);
+                }
+                return false;
             }
 
-            if (response.Value.VoteGranted && voters.Add(peer))
+            if (response.Value.VoteGranted && granters.Add(peer))
             {
-                Trace($"got vote from {peer} in term {term} ({voters.Count} so far)");
+                Trace(
+                    $"{(request.PreVote ? "pre-vote" : "vote")} granted by {peer} for term "
+                        + $"{request.Term} ({granters.Count} so far)");
 
-                // Quorum is asked of the configuration, not computed here, so the joint rule --
-                // a majority of both old and new voters during a membership change -- applies
-                // uniformly and cannot be forgotten at one call site.
-                if (configuration.HasQuorum(voters))
-                {
-                    await BecomeLeaderAsync(term, cancellationToken).ConfigureAwait(false);
-                    return;
-                }
+                if (configuration.HasQuorum(granters)) return true;
             }
         }
 
-        // No majority. The randomised timeout means the retry will not collide with the other
-        // candidates' retries, which is what lets a split vote resolve instead of repeating.
+        return false;
     }
 
     private async Task<(string Peer, RequestVoteResponse? Response)> SolicitVoteAsync(
@@ -667,7 +816,7 @@ public sealed class RaftNode : IAsyncDisposable
         }
 
         _leaderId = null;
-        _lastHeardFromLeader = DateTime.UtcNow;
+        _electionTimerResetAt = DateTime.UtcNow;
         _currentElectionTimeout = NextElectionTimeout();
     }
 
@@ -681,6 +830,19 @@ public sealed class RaftNode : IAsyncDisposable
         await _mutex.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
+            // The election restriction, which both rounds apply. A candidate whose log is behind
+            // ours must not win, because a leader is never allowed to be missing a committed
+            // entry -- and since a winner needs a majority, refusing here guarantees the winner's
+            // log contains everything committed.
+            bool candidateUpToDate =
+                request.LastLogTerm > _log.LastTerm
+                || (request.LastLogTerm == _log.LastTerm && request.LastLogIndex >= _log.LastIndex);
+
+            if (request.PreVote)
+            {
+                return HandlePreVoteLocked(request, candidateUpToDate);
+            }
+
             // A candidate from an older term is stale; telling it our term makes it step down.
             if (request.Term < _state.CurrentTerm)
             {
@@ -694,14 +856,6 @@ public sealed class RaftNode : IAsyncDisposable
 
             bool alreadyVotedElsewhere =
                 _state.VotedFor is not null && _state.VotedFor != request.CandidateId;
-
-            // The election restriction. A candidate whose log is behind ours must not win,
-            // because a leader is never allowed to be missing a committed entry -- and since a
-            // winner needs a majority, refusing here guarantees the winner's log contains
-            // everything committed.
-            bool candidateUpToDate =
-                request.LastLogTerm > _log.LastTerm
-                || (request.LastLogTerm == _log.LastTerm && request.LastLogIndex >= _log.LastIndex);
 
             bool grant = !alreadyVotedElsewhere && candidateUpToDate;
 
@@ -720,7 +874,7 @@ public sealed class RaftNode : IAsyncDisposable
 
                 // Granting a vote counts as hearing from the cluster, so this node does not
                 // immediately launch a competing candidacy of its own.
-                _lastHeardFromLeader = DateTime.UtcNow;
+                _electionTimerResetAt = DateTime.UtcNow;
                 _currentElectionTimeout = NextElectionTimeout();
             }
 
@@ -730,6 +884,60 @@ public sealed class RaftNode : IAsyncDisposable
         {
             _mutex.Release();
         }
+    }
+
+    /// <summary>
+    /// Answers a pre-vote straw poll without changing anything.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Three properties make this safe and useful, and all three are easy to get wrong:
+    /// </para>
+    /// <list type="number">
+    /// <item>
+    /// <b>Nothing is persisted and no term advances.</b> That is the entire point — a pre-vote
+    /// from a node with a higher term must not make this node step down, or the straw poll would
+    /// cause exactly the disruption it exists to avoid.
+    /// </item>
+    /// <item>
+    /// <b>A recent leader is a refusal.</b> If this node has heard from a leader within its own
+    /// election timeout, it believes a leader exists and says no. This is what stops a rejoining
+    /// partitioned node from unseating a healthy leader: a majority will all have heard from that
+    /// leader, so the candidate never reaches the real round.
+    /// </item>
+    /// <item>
+    /// <b>The election timer is not reset.</b> Unlike granting a real vote, answering a straw poll
+    /// must not delay this node's own candidacy — otherwise a node could keep every peer quiet
+    /// just by polling them.
+    /// </item>
+    /// </list>
+    /// </remarks>
+    private RequestVoteResponse HandlePreVoteLocked(
+        RequestVoteRequest request,
+        bool candidateUpToDate)
+    {
+        bool staleTerm = request.Term < _state.CurrentTerm;
+
+        // A leader refuses, because it knows a leader exists -- itself. Without this clause a
+        // healthy leader would answer a straw poll for a higher term, since nothing ever
+        // "contacts" it, and could then be unseated by the real round that followed. That is
+        // precisely the disruption pre-vote is supposed to prevent, so a leader that granted
+        // these would defeat the whole mechanism.
+        bool leaderIsAlive =
+            _role == RaftRole.Leader
+            || DateTime.UtcNow - _lastLeaderContact < _currentElectionTimeout;
+
+        bool grant = !staleTerm && !leaderIsAlive && candidateUpToDate;
+
+        Trace(
+            $"PRE-vote from {request.CandidateId} for term {request.Term} "
+                + $"(log {request.LastLogIndex}@{request.LastLogTerm}): "
+                + $"myTerm={_state.CurrentTerm} myLog={_log.LastIndex}@{_log.LastTerm} "
+                + $"leaderAlive={leaderIsAlive} upToDate={candidateUpToDate} "
+                + $"-> {(grant ? "GRANT" : "refuse")}");
+
+        return new RequestVoteResponse(
+            _state.CurrentTerm, grant, _options.NodeId, PreVote: true);
     }
 
     /// <summary>Handles replication or a heartbeat from a leader.</summary>
@@ -766,7 +974,11 @@ public sealed class RaftNode : IAsyncDisposable
             }
 
             _leaderId = request.LeaderId;
-            _lastHeardFromLeader = DateTime.UtcNow;
+
+            // Both clocks: this resets the election timer and is also the one event that counts
+            // as a leader being alive, which is what a pre-vote asks about.
+            _electionTimerResetAt = DateTime.UtcNow;
+            _lastLeaderContact = _electionTimerResetAt;
             _currentElectionTimeout = NextElectionTimeout();
 
             // The consistency check. Agreeing on the entry immediately before the batch proves,
@@ -1222,8 +1434,18 @@ public sealed class RaftNode : IAsyncDisposable
     /// </para>
     /// </remarks>
     /// <exception cref="NotLeaderException">This node is not the leader.</exception>
+    public Task ChangeMembershipAsync(
+        IReadOnlyList<string> newVoters,
+        CancellationToken cancellationToken = default) =>
+        ChangeMembershipAsync(newVoters, newLearners: null, cancellationToken);
+
+    /// <summary>
+    /// Changes cluster membership to <paramref name="newVoters"/> and
+    /// <paramref name="newLearners"/>, via joint consensus.
+    /// </summary>
     public async Task ChangeMembershipAsync(
         IReadOnlyList<string> newVoters,
+        IReadOnlyList<string>? newLearners,
         CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(newVoters);
@@ -1248,13 +1470,17 @@ public sealed class RaftNode : IAsyncDisposable
                     "A membership change is already in progress; wait for it to commit.");
             }
 
+            var targetLearners = newLearners ?? _configuration.Learners;
+
             if (_configuration.Voters.Count == newVoters.Count
-                && newVoters.All(_configuration.Voters.Contains))
+                && newVoters.All(_configuration.Voters.Contains)
+                && _configuration.Learners.Count == targetLearners.Count
+                && targetLearners.All(_configuration.Learners.Contains))
             {
                 return; // already there
             }
 
-            joint = _configuration.BeginTransitionTo(newVoters);
+            joint = _configuration.BeginTransitionTo(newVoters, targetLearners);
         }
         finally
         {
@@ -1277,7 +1503,131 @@ public sealed class RaftNode : IAsyncDisposable
         }
     }
 
-    /// <summary>Adds a server to the cluster.</summary>
+    /// <summary>
+    /// Adds a non-voting learner, which needs no joint phase.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// A single configuration entry is sufficient and safe, because a learner is counted in no
+    /// quorum: no majority anywhere changes size, so there is no window in which two disjoint
+    /// majorities could exist. That is the whole reason learners are worth having.
+    /// </para>
+    /// <para>
+    /// Compare with adding a voter directly. A three-node cluster admitting a fourth voter
+    /// immediately needs three of four rather than two of three, so until the newcomer has
+    /// caught up the cluster tolerates <i>fewer</i> failures than before — and a newcomer with an
+    /// empty log can take a long time to catch up, especially if a whole snapshot has to be
+    /// transferred. Adding it as a learner costs nothing, and promotion happens when it is
+    /// already current.
+    /// </para>
+    /// </remarks>
+    public async Task AddLearnerAsync(string nodeId, CancellationToken cancellationToken = default)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(nodeId);
+        ObjectDisposedException.ThrowIf(_disposed, this);
+
+        RaftConfiguration target;
+
+        await _mutex.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            if (_role != RaftRole.Leader) throw new NotLeaderException(_leaderId);
+
+            if (_configuration.IsJoint)
+            {
+                throw new InvalidOperationException(
+                    "A membership change is in progress; wait for it to commit.");
+            }
+
+            if (_configuration.IsLearner(nodeId)) return;
+
+            target = _configuration.WithLearner(nodeId);
+        }
+        finally
+        {
+            _mutex.Release();
+        }
+
+        Trace($"adding learner {nodeId}; no joint phase is needed");
+        await ProposeConfigurationAsync(target, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Promotes a learner to a voter, through joint consensus.
+    /// </summary>
+    /// <remarks>
+    /// This <i>does</i> need the joint phase, because it changes the size of every majority. The
+    /// difference from adding a voter outright is timing: by the time a learner is promoted it is
+    /// already current, so it can answer immediately and the window of reduced fault tolerance is
+    /// as short as a round trip rather than as long as a state transfer.
+    /// </remarks>
+    public async Task PromoteLearnerAsync(
+        string nodeId,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(nodeId);
+        ObjectDisposedException.ThrowIf(_disposed, this);
+
+        List<string> voters;
+        List<string> learners;
+
+        await _mutex.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            if (_role != RaftRole.Leader) throw new NotLeaderException(_leaderId);
+
+            if (_configuration.IsVoter(nodeId)) return; // already promoted
+
+            if (!_configuration.IsLearner(nodeId))
+            {
+                throw new InvalidOperationException(
+                    $"'{nodeId}' is not a learner of this cluster; add it with AddLearnerAsync "
+                        + "first.");
+            }
+
+            voters = [.. _configuration.Voters, nodeId];
+            learners = [.. _configuration.Learners.Where(l => l != nodeId)];
+        }
+        finally
+        {
+            _mutex.Release();
+        }
+
+        Trace($"promoting learner {nodeId} to voter");
+        await ChangeMembershipAsync(voters, learners, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// How far behind the leader a member is, in log entries, or null if not known.
+    /// </summary>
+    /// <remarks>
+    /// The number an operator needs before promoting a learner: a learner still streaming a
+    /// snapshot should not be made a voter, because until it is current it is a quorum member
+    /// that cannot answer.
+    /// </remarks>
+    public long? ReplicationLagOf(string nodeId)
+    {
+        _mutex.Wait();
+        try
+        {
+            if (_role != RaftRole.Leader) return null;
+            if (!_matchIndex.TryGetValue(nodeId, out long matchIndex)) return null;
+            return Math.Max(0, _log.LastIndex - matchIndex);
+        }
+        finally
+        {
+            _mutex.Release();
+        }
+    }
+
+    /// <summary>
+    /// Adds a server directly as a voter, through joint consensus.
+    /// </summary>
+    /// <remarks>
+    /// Correct, but <see cref="AddLearnerAsync"/> followed by <see cref="PromoteLearnerAsync"/> is
+    /// the better sequence: this makes the newcomer a quorum member while its log is still empty,
+    /// so the cluster's fault tolerance is reduced for as long as the catch-up takes.
+    /// </remarks>
     public Task AddServerAsync(string nodeId, CancellationToken cancellationToken = default)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(nodeId);
@@ -1289,21 +1639,53 @@ public sealed class RaftNode : IAsyncDisposable
         return ChangeMembershipAsync(target, cancellationToken);
     }
 
-    /// <summary>Removes a server from the cluster.</summary>
-    public Task RemoveServerAsync(string nodeId, CancellationToken cancellationToken = default)
+    /// <summary>
+    /// Removes a server, voting or not.
+    /// </summary>
+    /// <remarks>
+    /// Removing a learner needs no joint phase, for the same reason adding one does not: it is in
+    /// no quorum, so no majority changes size. Removing a voter does.
+    /// </remarks>
+    public async Task RemoveServerAsync(
+        string nodeId,
+        CancellationToken cancellationToken = default)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(nodeId);
+        ObjectDisposedException.ThrowIf(_disposed, this);
 
-        var target = Configuration.Voters.Where(v => v != nodeId).ToList();
-        if (target.Count == Configuration.Voters.Count) return Task.CompletedTask;
+        var configuration = Configuration;
 
-        if (target.Count == 0)
+        if (configuration.IsLearner(nodeId))
+        {
+            RaftConfiguration target;
+
+            await _mutex.WaitAsync(cancellationToken).ConfigureAwait(false);
+            try
+            {
+                if (_role != RaftRole.Leader) throw new NotLeaderException(_leaderId);
+                target = _configuration.WithoutLearner(nodeId);
+            }
+            finally
+            {
+                _mutex.Release();
+            }
+
+            Trace($"removing learner {nodeId}; no joint phase is needed");
+            await ProposeConfigurationAsync(target, cancellationToken).ConfigureAwait(false);
+            return;
+        }
+
+        var remaining = configuration.Voters.Where(v => v != nodeId).ToList();
+        if (remaining.Count == configuration.Voters.Count) return;
+
+        if (remaining.Count == 0)
         {
             throw new InvalidOperationException(
                 "Refusing to remove the last voter; the cluster would have no one to elect.");
         }
 
-        return ChangeMembershipAsync(target, cancellationToken);
+        await ChangeMembershipAsync(remaining, configuration.Learners, cancellationToken)
+            .ConfigureAwait(false);
     }
 
     private async Task ProposeConfigurationAsync(
@@ -1371,7 +1753,8 @@ public sealed class RaftNode : IAsyncDisposable
     /// </summary>
     /// <remarks>
     /// <para>
-    /// Driven from the tick rather than only from <see cref="ChangeMembershipAsync"/>, because
+    /// Driven from the tick rather than only from
+    /// <see cref="ChangeMembershipAsync(IReadOnlyList{string}, CancellationToken)"/>, because
     /// the second phase can be abandoned in ways that call has no say over: the caller cancels,
     /// the caller's process dies, or the leader that started the change is replaced. Any of those
     /// used to leave the cluster joint indefinitely — not broken, but permanently requiring two
@@ -1656,7 +2039,11 @@ public sealed class RaftNode : IAsyncDisposable
             }
 
             _leaderId = request.LeaderId;
-            _lastHeardFromLeader = DateTime.UtcNow;
+
+            // Both clocks: this resets the election timer and is also the one event that counts
+            // as a leader being alive, which is what a pre-vote asks about.
+            _electionTimerResetAt = DateTime.UtcNow;
+            _lastLeaderContact = _electionTimerResetAt;
             _currentElectionTimeout = NextElectionTimeout();
         }
         finally
@@ -1664,33 +2051,53 @@ public sealed class RaftNode : IAsyncDisposable
             _mutex.Release();
         }
 
-        // Offset zero starts a fresh transfer, discarding any partial one. A leader restarts from
-        // zero after a failure, so this is how a stalled transfer is abandoned.
-        if (request.Offset == 0)
+        string assembled;
+
+        await _snapshotReceiveMutex.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
         {
-            _incoming?.Dispose();
-            _incoming = new IncomingSnapshot(
-                Path.Combine(_options.DataDirectory, "snapshot.incoming"));
-        }
+            if (_disposed)
+            {
+                return new InstallSnapshotResponse(
+                    _state.CurrentTerm, _options.NodeId, 0, Success: false);
+            }
 
-        if (_incoming is null || _incoming.Length != request.Offset)
+            // Offset zero starts a fresh transfer, discarding any partial one. A leader restarts
+            // from zero after a failure, so this is how a stalled transfer is abandoned.
+            if (request.Offset == 0)
+            {
+                _incoming?.Dispose();
+                _incoming = new IncomingSnapshot(
+                    Path.Combine(_options.DataDirectory, "snapshot.incoming"));
+            }
+
+            // A local reference, so that nothing below can be left holding a file another call
+            // has already closed.
+            IncomingSnapshot? incoming = _incoming;
+
+            if (incoming is null || incoming.Length != request.Offset)
+            {
+                // Out of order: tell the leader what we hold so it can resume correctly.
+                return new InstallSnapshotResponse(
+                    _state.CurrentTerm, _options.NodeId, incoming?.Length ?? 0, Success: true);
+            }
+
+            await incoming.AppendAsync(request.Data, cancellationToken).ConfigureAwait(false);
+
+            if (!request.Done)
+            {
+                return new InstallSnapshotResponse(
+                    _state.CurrentTerm, _options.NodeId, incoming.Length, Success: true);
+            }
+
+            assembled = incoming.Path;
+            incoming.Complete();
+            _incoming = null;
+        }
+        finally
         {
-            // Out of order: tell the leader what we actually hold so it can resume correctly.
-            return new InstallSnapshotResponse(
-                _state.CurrentTerm, _options.NodeId, _incoming?.Length ?? 0, Success: true);
+            _snapshotReceiveMutex.Release();
         }
-
-        await _incoming.AppendAsync(request.Data, cancellationToken).ConfigureAwait(false);
-
-        if (!request.Done)
-        {
-            return new InstallSnapshotResponse(
-                _state.CurrentTerm, _options.NodeId, _incoming.Length, Success: true);
-        }
-
-        string assembled = _incoming.Path;
-        _incoming.Complete();
-        _incoming = null;
 
         await InstallReceivedSnapshotAsync(request, assembled, cancellationToken)
             .ConfigureAwait(false);
@@ -1949,13 +2356,23 @@ public sealed class RaftNode : IAsyncDisposable
             _mutex.Release();
         }
 
-        _incoming?.Dispose();
-        _incoming = null;
+        // Drain rather than yank: a chunk still being written owns the handle until it returns.
+        await _snapshotReceiveMutex.WaitAsync().ConfigureAwait(false);
+        try
+        {
+            _incoming?.Dispose();
+            _incoming = null;
+        }
+        finally
+        {
+            _snapshotReceiveMutex.Release();
+        }
 
         await _log.DisposeAsync().ConfigureAwait(false);
         _shutdown.Dispose();
         _mutex.Dispose();
         _applyMutex.Dispose();
+        _snapshotReceiveMutex.Dispose();
     }
 }
 
@@ -2034,6 +2451,15 @@ public sealed record RaftStats
 
     /// <summary>Membership changes this node has driven to completion as leader.</summary>
     public long MembershipChanges { get; init; }
+
+    /// <summary>Pre-vote rounds this node won, each of which became a real campaign.</summary>
+    public long PreVotesWon { get; init; }
+
+    /// <summary>
+    /// Pre-vote rounds this node lost. Each one is an election that was <i>avoided</i>: the term
+    /// was never incremented and the rest of the cluster never noticed.
+    /// </summary>
+    public long PreVotesLost { get; init; }
 
     /// <summary>The cluster configuration in force.</summary>
     public RaftConfiguration? Configuration { get; init; }

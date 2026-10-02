@@ -105,10 +105,16 @@ internal static class RaftWire
             writer.Write(request.CandidateId);
             writer.Write(request.LastLogIndex);
             writer.Write(request.LastLogTerm);
+            writer.Write(request.PreVote);
         });
 
     internal static RequestVoteRequest DecodeRequestVoteRequest(BinaryReader reader) =>
-        new(reader.ReadInt64(), reader.ReadString(), reader.ReadInt64(), reader.ReadInt64());
+        new(
+            reader.ReadInt64(),
+            reader.ReadString(),
+            reader.ReadInt64(),
+            reader.ReadInt64(),
+            reader.ReadBoolean());
 
     internal static byte[] Encode(RequestVoteResponse response) =>
         Frame(RaftMessageKind.RequestVoteResponse, writer =>
@@ -116,10 +122,15 @@ internal static class RaftWire
             writer.Write(response.Term);
             writer.Write(response.VoteGranted);
             writer.Write(response.VoterId);
+            writer.Write(response.PreVote);
         });
 
     internal static RequestVoteResponse DecodeRequestVoteResponse(BinaryReader reader) =>
-        new(reader.ReadInt64(), reader.ReadBoolean(), reader.ReadString());
+        new(
+            reader.ReadInt64(),
+            reader.ReadBoolean(),
+            reader.ReadString(),
+            reader.ReadBoolean());
 
     internal static byte[] Encode(AppendEntriesRequest request)
     {
