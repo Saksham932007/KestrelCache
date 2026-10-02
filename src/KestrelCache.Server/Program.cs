@@ -65,7 +65,18 @@ if (args.Length > 0 && args[0] is "-h" or "--help" or "help")
     return 0;
 }
 
-var options = ParseOptions(args);
+ServerOptions options;
+try
+{
+    options = ParseOptions(args);
+}
+catch (Exception ex) when (ex is ArgumentException or FormatException or OverflowException)
+{
+    // A usage mistake is not a crash: a stack trace buries the one line that says what to fix,
+    // and in a container it is the only output anyone will ever see.
+    Console.Error.WriteLine($"kestrel-server: {ex.Message}");
+    return 2;
+}
 
 Console.WriteLine($"KestrelCache server {ServerVersion()}");
 Console.WriteLine($"  engine        {options.Engine}");
@@ -209,9 +220,25 @@ static ServerOptions ParseOptions(string[] argv)
         if (!argv[i].StartsWith("--", StringComparison.Ordinal)) continue;
 
         string name = argv[i][2..];
-        string? value = i + 1 < argv.Length && !argv[i + 1].StartsWith("--", StringComparison.Ordinal)
-            ? argv[++i]
-            : null;
+        string? value;
+
+        // Both spellings. `--name value` is what the help text shows and what a shell user
+        // types; `--name=value` is what every Docker CMD and compose file uses, and accepting
+        // only the first is how a three-node cluster quietly came up as three unrelated
+        // single-node servers: every flag arrived as one `--raft-id=n1` token, matched no case,
+        // and was discarded by the switch's default.
+        int equals = name.IndexOf('=');
+        if (equals >= 0)
+        {
+            value = name[(equals + 1)..];
+            name = name[..equals];
+        }
+        else
+        {
+            value = i + 1 < argv.Length && !argv[i + 1].StartsWith("--", StringComparison.Ordinal)
+                ? argv[++i]
+                : null;
+        }
 
         options = name switch
         {
@@ -245,7 +272,20 @@ static ServerOptions ParseOptions(string[] argv)
             {
                 RaftHeartbeatInterval = TimeSpan.FromMilliseconds(int.Parse(value)),
             },
-            _ => options,
+
+            // Handled before parsing, but has to be named here so it is not treated as unknown.
+            "raft-trace" => options,
+
+            // Refusing beats ignoring. A silently dropped flag is indistinguishable from a flag
+            // that was honoured until something downstream behaves inexplicably -- which is
+            // precisely how the clustered compose stack ran for three commits without anyone
+            // noticing that none of the nodes had replication switched on at all. The server
+            // already refuses unsupported commands rather than ignoring them; its own arguments
+            // deserve the same treatment.
+            _ => throw new ArgumentException(
+                value is null && KnownFlagNeedsValue(name)
+                    ? $"option --{name} requires a value"
+                    : $"unknown option --{name}; run with --help for the supported set"),
         };
     }
 
@@ -253,3 +293,10 @@ static ServerOptions ParseOptions(string[] argv)
 }
 
 static string ServerVersion() => KestrelCache.Server.Commands.ServerCommands.Version;
+
+// Distinguishes "you misspelled this" from "you forgot its value", because the two have very
+// different fixes and the switch above cannot tell them apart on its own.
+static bool KnownFlagNeedsValue(string name) => name is
+    "port" or "bind" or "data" or "engine" or "sync" or "metrics-port" or "max-clients"
+    or "requirepass" or "raft-id" or "raft-peers" or "raft-port" or "raft-election-timeout"
+    or "raft-heartbeat";

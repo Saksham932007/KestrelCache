@@ -38,8 +38,24 @@ series at all. The job wrote five keys and then required the metric to be presen
 `COMPACT` first, which flushes the memtable, makes the gauge real, and incidentally gives a
 supported command its first coverage.
 
+**The clustered compose stack had never enabled clustering.** Once the image built, the cluster job
+ran for the first time and reported three nodes all answering `cluster_enabled:0`. Both compose
+files pass every flag as `--name=value`; the argument parser only understood `--name value`, so
+`--raft-id=n1` matched no case and the switch's `_ => options` default discarded it. Three
+unrelated single-node servers came up looking perfectly healthy. The single-node stack had the
+same bug and passed anyway, because every value it passes happens to equal the default.
+
+The parser now accepts both spellings, and — more importantly — **refuses an unrecognised flag
+instead of ignoring it**, distinguishing a misspelling from a missing value. A silently dropped
+option is indistinguishable from one that was honoured until something downstream behaves
+inexplicably, which is exactly how this survived three commits. The server already refuses
+unsupported commands rather than ignoring them; its own arguments now get the same treatment, and
+a usage mistake prints one line and exits 2 rather than a stack trace, since in a container that
+line is the only output anyone will see. CI asserts both refusals.
+
 Found by actually reading the run rather than the badge: 305 tests pass on Linux and macOS, and the
-container image, metrics endpoint and `redis-cli` exchange were reproduced locally under podman
+container image, the metrics endpoint, the `redis-cli` exchange, the bad-flag refusals and a real
+three-node cluster formed from the compose arguments were all reproduced locally under podman
 before pushing.
 
 ## Learner members and pre-vote — 2026-10-03
