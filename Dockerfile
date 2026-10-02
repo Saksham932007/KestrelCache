@@ -7,9 +7,16 @@ WORKDIR /src
 # Project files first, so `restore` is cached independently of source changes. Editing a .cs
 # file then rebuilds without re-downloading every NuGet package, which is the difference between
 # a two-second and a two-minute rebuild.
-COPY Directory.Build.props KestrelCache.sln ./
+# Every project in the solution has to be listed, and every file restore reads: the solution
+# names all of them, so one missing .csproj fails the whole restore with MSB3202, and a missing
+# Directory.Packages.props fails it with NU1604 because central package management is what
+# supplies the versions the project files deliberately omit. global.json pins the SDK, and
+# copying it here is the difference between the pin applying to this build and being ignored
+# until after restore has already chosen a toolchain.
+COPY Directory.Build.props Directory.Packages.props global.json KestrelCache.sln ./
 COPY src/KestrelCache/KestrelCache.csproj                     src/KestrelCache/
 COPY src/KestrelCache.Cli/KestrelCache.Cli.csproj             src/KestrelCache.Cli/
+COPY src/KestrelCache.Raft/KestrelCache.Raft.csproj           src/KestrelCache.Raft/
 COPY src/KestrelCache.Server/KestrelCache.Server.csproj       src/KestrelCache.Server/
 COPY tests/KestrelCache.Tests/KestrelCache.Tests.csproj       tests/KestrelCache.Tests/
 COPY benchmarks/KestrelCache.Benchmarks/KestrelCache.Benchmarks.csproj benchmarks/KestrelCache.Benchmarks/

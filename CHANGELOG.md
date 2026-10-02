@@ -8,6 +8,40 @@ something, the entry says what was broken and what revealed it.
 
 ---
 
+## Fix a red CI pipeline — 2026-10-03
+
+Three bugs that CI had been reporting since it was added, and which nobody had read closely.
+
+**The container image never built.** The Dockerfile copies each `.csproj` individually so that
+`restore` caches independently of source changes, and `KestrelCache.Raft.csproj` was never added
+to that list when the Raft project was created. The solution names it, so `dotnet restore` failed
+with MSB3202 and took three jobs down with it — the image build, the compose stack, and the whole
+replicated-cluster job, which is why none of the cluster assertions had ever actually run.
+`Directory.Packages.props` and `global.json` were missing from the same layer and would have
+failed restore immediately afterwards: central package management is what supplies the versions
+the project files deliberately omit, and an SDK pin that is copied only after restore has already
+chosen a toolchain is not a pin.
+
+**Every Bitcask compaction test failed on Windows** — 15 tests, one cause. Compaction installs the
+rewritten log by renaming over the live path while both files are still open. POSIX allows that
+unconditionally, which is the whole basis of the design: readers holding a descriptor finish
+against the old inode and never block. Windows refuses to replace a file unless every open handle
+to it granted delete sharing, so the install failed with "being used by another process" on every
+run while passing on Linux. The log is now opened `FileShare.Read | FileShare.Delete`, which makes
+Windows behave the way the compaction path already assumed. The alternative — closing the handle
+before the rename and reopening after, which is what the Raft log does — is simpler but stalls
+readers, and not stalling readers is what the positional-I/O design is for.
+
+**The container job checked for a metric that cannot exist yet.** `kestrelcache_engine_sstables`
+is emitted one series per level, so a tree that has never flushed exports a bare header and no
+series at all. The job wrote five keys and then required the metric to be present. It now issues
+`COMPACT` first, which flushes the memtable, makes the gauge real, and incidentally gives a
+supported command its first coverage.
+
+Found by actually reading the run rather than the badge: 305 tests pass on Linux and macOS, and the
+container image, metrics endpoint and `redis-cli` exchange were reproduced locally under podman
+before pushing.
+
 ## Learner members and pre-vote — 2026-10-03
 
 Closes the two Raft gaps the previous release documented, and the two concurrency bugs the work

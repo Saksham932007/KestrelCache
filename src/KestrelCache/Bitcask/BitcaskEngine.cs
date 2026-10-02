@@ -97,7 +97,16 @@ public sealed class BitcaskEngine : IStorageEngine
             {
                 Mode = FileMode.OpenOrCreate,
                 Access = FileAccess.ReadWrite,
-                Share = FileShare.Read,
+                // FileShare.Delete is what makes compaction work on Windows. Compaction installs
+                // the rewritten log by renaming over this path while this handle is still open,
+                // which POSIX permits unconditionally -- the old inode survives for whoever holds
+                // a descriptor. Windows refuses to replace or rename a file unless every open
+                // handle to it was opened granting delete sharing, so without this flag the
+                // install fails with "being used by another process" and every compaction test
+                // fails there while passing on Linux. With it, Windows behaves the way the
+                // compaction path already assumed: the rename succeeds and readers still holding
+                // the old handle keep reading the old bytes to completion.
+                Share = FileShare.Read | FileShare.Delete,
                 // Buffering is disabled because all I/O is positional: a FileStream buffer would
                 // sit between RandomAccess writes and RandomAccess reads of the same handle and
                 // make them incoherent. The stream exists only to provide fsync.
@@ -666,6 +675,13 @@ public sealed class BitcaskEngine : IStorageEngine
     /// therefore atomic: a crash at any point leaves either the complete old log or the complete
     /// new one, never a half-built file. Readers already working against the old generation keep
     /// their file descriptor and finish normally.
+    /// <para>
+    /// Both files are open while that rename happens, which is free on POSIX and requires
+    /// <see cref="FileShare.Delete"/> on Windows -- see the share flags in <c>OpenLog</c>. The
+    /// alternative, closing the handle before the rename and reopening after, is what the Raft
+    /// log does; it is simpler but it stalls readers, which is the one thing this engine's
+    /// positional-I/O design exists to avoid.
+    /// </para>
     /// </remarks>
     public async ValueTask CompactAsync(CancellationToken cancellationToken = default)
     {
