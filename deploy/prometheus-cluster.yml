@@ -1,0 +1,26 @@
+# Scrape configuration for the three-node cluster.
+global:
+  scrape_interval: 5s
+  evaluation_interval: 15s
+  external_labels:
+    stack: kestrelcache-cluster
+
+rule_files:
+  - /etc/prometheus/alerts.yml
+
+scrape_configs:
+  - job_name: kestrelcache
+    # One target per node, each labelled, so a dashboard can break every panel down by node --
+    # which is what makes a leader change visible as a shift between series rather than as an
+    # unexplained discontinuity in an aggregate.
+    static_configs:
+      - targets: ["kc1:9180"]
+        labels: { node: n1 }
+      - targets: ["kc2:9180"]
+        labels: { node: n2 }
+      - targets: ["kc3:9180"]
+        labels: { node: n3 }
+
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]

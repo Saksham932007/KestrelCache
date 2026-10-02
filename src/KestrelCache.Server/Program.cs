@@ -21,6 +21,24 @@ if (args.Length > 0 && args[0] is "-h" or "--help" or "help")
           --max-clients N   Connection limit (default 10000; 0 unlimited)
           --requirepass P   Require AUTH before serving commands
 
+        CLUSTERING (Raft)
+          --raft-id ID      This node's id; enables replication
+          --raft-peers LIST Comma-separated id=host:port for every node, this one included
+          --raft-port N     Port for peer traffic (default 7380)
+          --raft-trace      Log every role transition and election decision
+
+        A THREE-NODE CLUSTER
+          Run each on its own ports, then write to whichever node reports itself leader:
+
+            kestrel-server --raft-id n1 --raft-port 7381 --port 6381 --data ./d1 \
+              --raft-peers n1=127.0.0.1:7381,n2=127.0.0.1:7382,n3=127.0.0.1:7383
+            kestrel-server --raft-id n2 --raft-port 7382 --port 6382 --data ./d2 --raft-peers ...
+            kestrel-server --raft-id n3 --raft-port 7383 --port 6383 --data ./d3 --raft-peers ...
+
+            redis-cli -p 6381 cluster info
+            redis-cli -p 6381 set replicated yes      # -NOTLEADER names the leader if not here
+            redis-cli -p 6382 get replicated          # followers serve reads
+
         TRY IT
           redis-cli -p 6380 set hello world
           redis-cli -p 6380 get hello
@@ -38,7 +56,33 @@ Console.WriteLine($"  engine        {options.Engine}");
 Console.WriteLine($"  data          {Path.GetFullPath(options.DataPath)}");
 Console.WriteLine($"  durability    {options.SyncPolicy}");
 
-var database = await KestrelDb.OpenAsync(options.ToDatabaseOptions(), options.Engine);
+// A clustered node puts consensus between the protocol layer and the storage engine, but
+// presents the same IStorageEngine interface -- so everything above this point is identical in
+// both deployments.
+ClusterHost? cluster = null;
+KestrelDb database;
+
+if (options.IsClustered)
+{
+    var localEngine = options.Engine == EngineKind.Bitcask
+        ? (IStorageEngine)await KestrelCache.Bitcask.BitcaskEngine.OpenAsync(options.ToDatabaseOptions())
+        : await KestrelCache.Lsm.LsmEngine.OpenAsync(options.ToDatabaseOptions());
+
+    Action<string>? trace = args.Contains("--raft-trace")
+        ? message => Console.WriteLine($"  raft {message}")
+        : null;
+
+    cluster = await ClusterHost.StartAsync(options, localEngine, trace);
+    database = KestrelDb.Wrap(cluster.Engine);
+
+    Console.WriteLine($"  cluster       {options.RaftNodeId} of "
+        + $"[{string.Join(", ", options.RaftPeers)}]");
+    Console.WriteLine($"  raft          0.0.0.0:{cluster.RaftPort}");
+}
+else
+{
+    database = await KestrelDb.OpenAsync(options.ToDatabaseOptions(), options.Engine);
+}
 
 await using (database)
 {
@@ -123,6 +167,15 @@ await using (database)
     Console.WriteLine(
         $"served {server.Metrics.CommandsTotal:N0} command(s); "
             + $"{stats.Writes:N0} write(s), {stats.Reads:N0} read(s), {stats.Syncs:N0} fsync(s)");
+
+    if (cluster is not null)
+    {
+        var raft = cluster.Node.GetStats();
+        Console.WriteLine(
+            $"raft: {raft.Role} in term {raft.Term}, log {raft.LastLogIndex}, "
+                + $"committed {raft.CommitIndex}, applied {raft.LastApplied}");
+        await cluster.DisposeAsync();
+    }
 }
 
 Console.WriteLine("stopped");
@@ -157,6 +210,21 @@ static ServerOptions ParseOptions(string[] argv)
             "metrics-port" when value is not null => options with { MetricsPort = int.Parse(value) },
             "max-clients" when value is not null => options with { MaxConnections = int.Parse(value) },
             "requirepass" when value is not null => options with { RequirePassword = value },
+            "raft-id" when value is not null => options with { RaftNodeId = value },
+            "raft-peers" when value is not null => options with
+            {
+                RaftPeers = value.Split(',', StringSplitOptions.RemoveEmptyEntries
+                    | StringSplitOptions.TrimEntries),
+            },
+            "raft-port" when value is not null => options with { RaftPort = int.Parse(value) },
+            "raft-election-timeout" when value is not null => options with
+            {
+                RaftElectionTimeout = TimeSpan.FromMilliseconds(int.Parse(value)),
+            },
+            "raft-heartbeat" when value is not null => options with
+            {
+                RaftHeartbeatInterval = TimeSpan.FromMilliseconds(int.Parse(value)),
+            },
             _ => options,
         };
     }

@@ -1,11 +1,10 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
-    <RootNamespace>KestrelCache</RootNamespace>
-    <AssemblyName>KestrelCache</AssemblyName>
+    <RootNamespace>KestrelCache.Raft</RootNamespace>
+    <AssemblyName>KestrelCache.Raft</AssemblyName>
     <GenerateDocumentationFile>true</GenerateDocumentationFile>
     <NoWarn>$(NoWarn);CS1591</NoWarn>
-    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
   </PropertyGroup>
 
   <ItemGroup>
@@ -13,9 +12,11 @@
   </ItemGroup>
 
   <ItemGroup>
+    <ProjectReference Include="../KestrelCache/KestrelCache.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
     <InternalsVisibleTo Include="KestrelCache.Tests" />
-    <InternalsVisibleTo Include="KestrelCache.Raft" />
-    <InternalsVisibleTo Include="kestrel-bench" />
   </ItemGroup>
 
 </Project>

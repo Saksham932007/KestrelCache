@@ -29,6 +29,7 @@ internal sealed class MetricsEndpoint(
 {
     private readonly CancellationTokenSource _shutdown = new();
     private Socket? _listener;
+    private int _disposed;
 
     /// <summary>The port actually bound.</summary>
     internal int BoundPort { get; private set; }
@@ -191,10 +192,21 @@ internal sealed class MetricsEndpoint(
         await stream.FlushAsync().ConfigureAwait(false);
     }
 
+    /// <remarks>
+    /// Guarded so that disposing twice is safe. Cancelling and then disposing a
+    /// <see cref="CancellationTokenSource"/> leaves a second call to throw
+    /// <see cref="ObjectDisposedException"/>, and double disposal is not an exotic case: nested
+    /// <c>await using</c> blocks, a teardown path that also disposes its children, and an
+    /// explicit close followed by a dispose all produce it. Throwing on teardown turns an
+    /// orderly shutdown into a crash.
+    /// </remarks>
     public async ValueTask DisposeAsync()
     {
+        if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
+
         await _shutdown.CancelAsync().ConfigureAwait(false);
         _listener?.Dispose();
+        _listener = null;
         _shutdown.Dispose();
     }
 }

@@ -108,6 +108,7 @@ internal static class CommandTable
         Add("FLUSHALL", -1, ServerCommands.FlushDbAsync, isWrite: true);
         Add("COMPACT", 1, ServerCommands.CompactAsync, isWrite: true);
         Add("BGSAVE", -1, ServerCommands.SaveAsync, isWrite: true);
+        Add("CLUSTER", -1, ServerCommands.ClusterAsync, requiresAuth: false);
         Add("SAVE", 1, ServerCommands.SaveAsync, isWrite: true);
 
         return table;

@@ -10,6 +10,7 @@
 
   <ItemGroup>
     <ProjectReference Include="../KestrelCache/KestrelCache.csproj" />
+    <ProjectReference Include="../KestrelCache.Raft/KestrelCache.Raft.csproj" />
   </ItemGroup>
 
   <ItemGroup>

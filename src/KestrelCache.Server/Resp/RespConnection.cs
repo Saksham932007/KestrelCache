@@ -187,6 +187,18 @@ internal sealed class RespConnection(
 
             await spec.Handler(context).ConfigureAwait(false);
         }
+        catch (Raft.NotLeaderException exception)
+        {
+            // A write reached a follower. The reply names the leader so the client can redirect
+            // rather than guess, and uses a distinct error code so a client library can act on
+            // it programmatically instead of pattern-matching a message.
+            metrics.CommandError();
+            RespWriter.WriteError(
+                writer,
+                exception.LeaderId is null
+                    ? "NOTLEADER no leader is currently known; retry shortly"
+                    : $"NOTLEADER the leader is {exception.LeaderId}");
+        }
         catch (KestrelCacheException exception)
         {
             // An engine-level failure is the client's business: it means the write did not

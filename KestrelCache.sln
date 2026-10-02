@@ -17,6 +17,8 @@ Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "KestrelCache.Benchmarks", "
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "KestrelCache.Server", "src\KestrelCache.Server\KestrelCache.Server.csproj", "{411E0700-052E-4282-B782-9320412AF76D}"
 EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "KestrelCache.Raft", "src\KestrelCache.Raft\KestrelCache.Raft.csproj", "{61CD21B9-96DE-4A6A-84A0-2341B7373459}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|Any CPU = Debug|Any CPU
@@ -87,6 +89,18 @@ Global
 		{411E0700-052E-4282-B782-9320412AF76D}.Release|x64.Build.0 = Release|Any CPU
 		{411E0700-052E-4282-B782-9320412AF76D}.Release|x86.ActiveCfg = Release|Any CPU
 		{411E0700-052E-4282-B782-9320412AF76D}.Release|x86.Build.0 = Release|Any CPU
+		{61CD21B9-96DE-4A6A-84A0-2341B7373459}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{61CD21B9-96DE-4A6A-84A0-2341B7373459}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{61CD21B9-96DE-4A6A-84A0-2341B7373459}.Debug|x64.ActiveCfg = Debug|Any CPU
+		{61CD21B9-96DE-4A6A-84A0-2341B7373459}.Debug|x64.Build.0 = Debug|Any CPU
+		{61CD21B9-96DE-4A6A-84A0-2341B7373459}.Debug|x86.ActiveCfg = Debug|Any CPU
+		{61CD21B9-96DE-4A6A-84A0-2341B7373459}.Debug|x86.Build.0 = Debug|Any CPU
+		{61CD21B9-96DE-4A6A-84A0-2341B7373459}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{61CD21B9-96DE-4A6A-84A0-2341B7373459}.Release|Any CPU.Build.0 = Release|Any CPU
+		{61CD21B9-96DE-4A6A-84A0-2341B7373459}.Release|x64.ActiveCfg = Release|Any CPU
+		{61CD21B9-96DE-4A6A-84A0-2341B7373459}.Release|x64.Build.0 = Release|Any CPU
+		{61CD21B9-96DE-4A6A-84A0-2341B7373459}.Release|x86.ActiveCfg = Release|Any CPU
+		{61CD21B9-96DE-4A6A-84A0-2341B7373459}.Release|x86.Build.0 = Release|Any CPU
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE
@@ -97,5 +111,6 @@ Global
 		{6505A367-C82A-40A3-B605-241DDC23B435} = {827E0CD3-B72D-47B6-A68D-7590B98EB39B}
 		{F4C40066-7026-475C-BB36-D8923EDE8F49} = {66320409-64EC-F7C5-3DEF-65E7510DAAD1}
 		{411E0700-052E-4282-B782-9320412AF76D} = {827E0CD3-B72D-47B6-A68D-7590B98EB39B}
+		{61CD21B9-96DE-4A6A-84A0-2341B7373459} = {827E0CD3-B72D-47B6-A68D-7590B98EB39B}
 	EndGlobalSection
 EndGlobal

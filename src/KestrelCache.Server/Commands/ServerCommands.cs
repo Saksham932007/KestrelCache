@@ -430,6 +430,23 @@ internal static class ServerCommands
             text.Append("\r\n");
         }
 
+        if (Wanted("replication") && context.Database.Engine is Raft.ReplicatedEngine replicated)
+        {
+            var raft = replicated.GetRaftStats();
+            text.Append("# Replication\r\n");
+            text.Append("role:").Append(raft.Role == Raft.RaftRole.Leader ? "master" : "slave")
+                .Append("\r\n");
+            text.Append("consensus:raft\r\n");
+            text.Append("node_id:").Append(raft.NodeId).Append("\r\n");
+            text.Append("raft_role:").Append(raft.Role.ToString().ToLowerInvariant()).Append("\r\n");
+            text.Append("raft_term:").Append(raft.Term).Append("\r\n");
+            text.Append("raft_leader:").Append(raft.LeaderId ?? "none").Append("\r\n");
+            text.Append("raft_log_index:").Append(raft.LastLogIndex).Append("\r\n");
+            text.Append("raft_commit_index:").Append(raft.CommitIndex).Append("\r\n");
+            text.Append("raft_last_applied:").Append(raft.LastApplied).Append("\r\n");
+            text.Append("\r\n");
+        }
+
         RespWriter.WriteBulkString(context.Output, text.ToString());
         return ValueTask.CompletedTask;
     }
@@ -501,6 +518,88 @@ internal static class ServerCommands
         // interpretation of SAVE here is "make everything acknowledged durable now".
         await context.Database.FlushAsync(context.CancellationToken).ConfigureAwait(false);
         RespWriter.WriteOk(context.Output);
+    }
+
+    /// <summary>
+    /// <c>CLUSTER INFO</c> and <c>CLUSTER NODES</c>, reporting this node's consensus state.
+    /// </summary>
+    /// <remarks>
+    /// Reuses Redis's command name and field shape where it fits, because operators and tooling
+    /// already know them — but the fields describe Raft, not Redis Cluster's hash slots, and
+    /// saying so plainly is better than inventing a resemblance that does not hold.
+    /// </remarks>
+    internal static ValueTask ClusterAsync(CommandContext context)
+    {
+        if (context.Database.Engine is not Raft.ReplicatedEngine replicated)
+        {
+            if (context.ArgumentCount >= 1 && context.Keyword(1) == "INFO")
+            {
+                RespWriter.WriteBulkString(
+                    context.Output,
+                    "cluster_enabled:0\r\ncluster_state:ok\r\ncluster_known_nodes:1\r\n");
+                return ValueTask.CompletedTask;
+            }
+
+            RespWriter.WriteError(
+                context.Output,
+                "ERR This instance is not replicated; start it with --raft-id and --raft-peers");
+            return ValueTask.CompletedTask;
+        }
+
+        var stats = replicated.GetRaftStats();
+
+        switch (context.ArgumentCount == 0 ? "INFO" : context.Keyword(1))
+        {
+            case "INFO":
+            {
+                var text = new StringBuilder();
+                text.Append("cluster_enabled:1\r\n");
+                text.Append("cluster_state:").Append(stats.LeaderId is null ? "down" : "ok").Append("\r\n");
+                text.Append("consensus:raft\r\n");
+                text.Append("node_id:").Append(stats.NodeId).Append("\r\n");
+                text.Append("role:").Append(stats.Role.ToString().ToLowerInvariant()).Append("\r\n");
+                text.Append("term:").Append(stats.Term).Append("\r\n");
+                text.Append("leader:").Append(stats.LeaderId ?? "none").Append("\r\n");
+                text.Append("log_index:").Append(stats.LastLogIndex).Append("\r\n");
+                text.Append("commit_index:").Append(stats.CommitIndex).Append("\r\n");
+                text.Append("last_applied:").Append(stats.LastApplied).Append("\r\n");
+                text.Append("log_bytes:").Append(stats.LogSizeBytes).Append("\r\n");
+                text.Append("elections_started:").Append(stats.ElectionsStarted).Append("\r\n");
+                text.Append("elections_won:").Append(stats.ElectionsWon).Append("\r\n");
+                RespWriter.WriteBulkString(context.Output, text.ToString());
+                break;
+            }
+
+            case "NODES":
+            {
+                var text = new StringBuilder();
+                text.Append(stats.NodeId).Append(' ')
+                    .Append("myself,").Append(stats.Role.ToString().ToLowerInvariant())
+                    .Append(" term=").Append(stats.Term)
+                    .Append(" log=").Append(stats.LastLogIndex)
+                    .Append(" commit=").Append(stats.CommitIndex)
+                    .Append("\r\n");
+
+                foreach (var (peerId, matchIndex) in stats.MatchIndex.OrderBy(p => p.Key))
+                {
+                    text.Append(peerId).Append(" peer match=").Append(matchIndex).Append("\r\n");
+                }
+
+                RespWriter.WriteBulkString(context.Output, text.ToString());
+                break;
+            }
+
+            case "MYID":
+                RespWriter.WriteBulkString(context.Output, stats.NodeId);
+                break;
+
+            default:
+                RespWriter.WriteError(
+                    context.Output, $"ERR Unknown CLUSTER subcommand '{context.Text(1)}'");
+                break;
+        }
+
+        return ValueTask.CompletedTask;
     }
 
     /// <summary>Assembly informational version, or a placeholder.</summary>

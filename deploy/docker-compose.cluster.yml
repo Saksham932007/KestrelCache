@@ -1,0 +1,128 @@
+# A three-node replicated cluster.
+#
+#   docker compose -f deploy/docker-compose.cluster.yml up -d --build
+#
+#   # find the leader
+#   for p in 6381 6382 6383; do redis-cli -p $p cluster info | grep -E 'role|leader'; done
+#
+#   # writes go to the leader; a follower answers -NOTLEADER and names it
+#   redis-cli -p 6381 set replicated yes
+#   redis-cli -p 6382 get replicated        # followers serve reads
+#
+#   # kill the leader and watch a new one take over within an election timeout
+#   docker compose -f deploy/docker-compose.cluster.yml kill kc1
+#   redis-cli -p 6382 cluster info
+#
+# Three nodes, not two: a cluster tolerates the loss of a minority, so a quorum of two out of
+# three survives one failure. Two nodes tolerate none at all -- losing either leaves the
+# remaining one unable to reach a majority, which is strictly worse than a single node, since it
+# has the same availability and twice the hardware.
+
+name: kestrelcache-cluster
+
+x-node: &node
+  build:
+    context: ..
+    dockerfile: Dockerfile
+  image: kestrelcache:local
+  restart: unless-stopped
+
+services:
+  kc1:
+    <<: *node
+    container_name: kc1
+    command:
+      - --raft-id=n1
+      - --raft-peers=n1=kc1:7380,n2=kc2:7380,n3=kc3:7380
+      - --raft-port=7380
+      - --port=6380
+      - --metrics-port=9180
+      - --data=/data/kc
+      - --engine=lsm
+      - --sync=interval
+    ports:
+      - "6381:6380"
+      - "9181:9180"
+    volumes:
+      - kc1-data:/data
+
+  kc2:
+    <<: *node
+    container_name: kc2
+    command:
+      - --raft-id=n2
+      - --raft-peers=n1=kc1:7380,n2=kc2:7380,n3=kc3:7380
+      - --raft-port=7380
+      - --port=6380
+      - --metrics-port=9180
+      - --data=/data/kc
+      - --engine=lsm
+      - --sync=interval
+    ports:
+      - "6382:6380"
+      - "9182:9180"
+    volumes:
+      - kc2-data:/data
+
+  kc3:
+    <<: *node
+    container_name: kc3
+    command:
+      - --raft-id=n3
+      - --raft-peers=n1=kc1:7380,n2=kc2:7380,n3=kc3:7380
+      - --raft-port=7380
+      - --port=6380
+      - --metrics-port=9180
+      - --data=/data/kc
+      - --engine=lsm
+      - --sync=interval
+    ports:
+      - "6383:6380"
+      - "9183:9180"
+    volumes:
+      - kc3-data:/data
+
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    container_name: kestrelcache-cluster-prometheus
+    restart: unless-stopped
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus-cluster.yml:/etc/prometheus/prometheus.yml:ro
+      - ./alerts.yml:/etc/prometheus/alerts.yml:ro
+      - prometheus-data:/prometheus
+    depends_on: [kc1, kc2, kc3]
+
+  grafana:
+    image: grafana/grafana:11.2.0
+    container_name: kestrelcache-cluster-grafana
+    restart: unless-stopped
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+      GF_AUTH_DISABLE_LOGIN_FORM: "true"
+      GF_USERS_DEFAULT_THEME: dark
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    depends_on: [prometheus]
+
+  cli:
+    image: redis:7-alpine
+    profiles: ["tools"]
+    entrypoint: ["redis-cli", "-h", "kc1", "-p", "6380"]
+    depends_on: [kc1]
+
+volumes:
+  kc1-data:
+  kc2-data:
+  kc3-data:
+  prometheus-data:
+  grafana-data:

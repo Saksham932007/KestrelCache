@@ -28,6 +28,7 @@
                       ReferenceOutputAssembly="false" />
 
     <ProjectReference Include="../../src/KestrelCache.Server/KestrelCache.Server.csproj" />
+    <ProjectReference Include="../../src/KestrelCache.Raft/KestrelCache.Raft.csproj" />
   </ItemGroup>
 
 </Project>

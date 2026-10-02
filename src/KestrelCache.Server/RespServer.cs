@@ -31,6 +31,7 @@ public sealed class RespServer(ServerOptions options, KestrelDb database) : IAsy
 
     private Socket? _listener;
     private long _nextConnectionId;
+    private int _disposed;
 
     /// <summary>The port actually bound, which differs from the request when port 0 was asked for.</summary>
     public int BoundPort { get; private set; }
@@ -168,11 +169,22 @@ public sealed class RespServer(ServerOptions options, KestrelDb database) : IAsy
     }
 
     /// <summary>Stops accepting and waits for in-flight connections to finish.</summary>
+    /// <remarks>
+    /// Guarded so that disposing twice is safe. Cancelling and then disposing a
+    /// <see cref="CancellationTokenSource"/> leaves a second call to throw
+    /// <see cref="ObjectDisposedException"/>, and double disposal is not an exotic case: nested
+    /// <c>await using</c> blocks, a teardown path that also disposes its children, and an
+    /// explicit close followed by a dispose all produce it. Throwing on teardown turns an
+    /// orderly shutdown into a crash.
+    /// </remarks>
     public async ValueTask DisposeAsync()
     {
+        if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
+
         await _shutdown.CancelAsync().ConfigureAwait(false);
         await DrainAsync().ConfigureAwait(false);
         _listener?.Dispose();
+        _listener = null;
         _shutdown.Dispose();
     }
 }
