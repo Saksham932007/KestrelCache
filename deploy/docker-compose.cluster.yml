@@ -13,6 +13,12 @@
 #   docker compose -f deploy/docker-compose.cluster.yml kill kc1
 #   redis-cli -p 6382 cluster info
 #
+#   # grow, shrink and compact it while it runs
+#   redis-cli -p 6381 cluster snapshot
+#   docker compose -f deploy/docker-compose.cluster.yml --profile grow up -d kc4
+#   redis-cli -p 6381 cluster addnode n4 kc4:7380
+#   redis-cli -p 6381 cluster removenode n2
+#
 # Three nodes, not two: a cluster tolerates the loss of a minority, so a quorum of two out of
 # three survives one failure. Two nodes tolerate none at all -- losing either leaves the
 # remaining one unable to reach a majority, which is strictly worse than a single node, since it
@@ -82,6 +88,31 @@ services:
     volumes:
       - kc3-data:/data
 
+  # A fourth node, for demonstrating a runtime membership change. Behind a profile so a plain
+  # `up` does not start a server that would sit with no voters until something admits it:
+  #
+  #   docker compose -f deploy/docker-compose.cluster.yml --profile grow up -d kc4
+  #   redis-cli -p 6381 cluster addnode n4 kc4:7380
+  kc4:
+    <<: *node
+    container_name: kc4
+    profiles: ["grow"]
+    command:
+      - --raft-id=n4
+      - --raft-join
+      - --raft-peers=n1=kc1:7380,n2=kc2:7380,n3=kc3:7380,n4=kc4:7380
+      - --raft-port=7380
+      - --port=6380
+      - --metrics-port=9180
+      - --data=/data/kc
+      - --engine=lsm
+      - --sync=interval
+    ports:
+      - "6384:6380"
+      - "9184:9180"
+    volumes:
+      - kc4-data:/data
+
   prometheus:
     image: prom/prometheus:v2.54.1
     container_name: kestrelcache-cluster-prometheus
@@ -124,5 +155,6 @@ volumes:
   kc1-data:
   kc2-data:
   kc3-data:
+  kc4-data:
   prometheus-data:
   grafana-data:

@@ -23,12 +23,15 @@ It speaks the Redis wire protocol, so `redis-cli` and `redis-benchmark` work aga
 | **Two storage engines** | A Bitcask-style append-only log with an in-memory hash index, and a log-structured merge tree with a write-ahead log, memtable, levelled SSTables, Bloom filters and a block cache. Both behind one interface, so their trade-offs are measured rather than asserted. |
 | **Real durability** | Three fsync policies with the cost of each measured, group commit to amortise it, and crash tests that `SIGKILL` a real process and verify every acknowledged write came back. |
 | **A server** | RESP over `System.IO.Pipelines`, verified against the genuine `redis-cli` and `redis-benchmark`. |
-| **Replication** | Raft — leader election, log replication, persistent state — with a three-node cluster that survives `kill -9` on its leader. |
+| **Replication** | Raft — leader election, log replication, persistent state, log snapshotting, and membership changes through joint consensus. Nodes can be added and removed while the cluster runs. |
 | **Observability** | Prometheus metrics with a latency histogram and engine internals, a provisioned Grafana dashboard, and six alert rules. |
-| **250 tests** | Including a model-based fuzzer, single-bit-flip corruption sweeps, SIGKILL crash consistency, and a Raft Log Matching verifier. |
+| **278 tests** | Including a model-based fuzzer, single-bit-flip corruption sweeps, SIGKILL crash consistency, and a Raft Log Matching verifier run under up to 40% message loss. |
 
-**[docs/DESIGN.md](docs/DESIGN.md) is the interesting document** — why each decision was made, what
-was measured, which bugs the measurements found, and what I would do differently.
+**The design documents are the interesting part** — why each decision was made, what was measured,
+which bugs the measurements found, and what is still missing:
+
+- **[docs/DESIGN.md](docs/DESIGN.md)** — storage engines, durability, concurrency, the server
+- **[docs/REPLICATION.md](docs/REPLICATION.md)** — Raft, log snapshotting, membership changes
 
 ---
 
@@ -138,15 +141,41 @@ it serves one node or three.
 ## Layout
 
 ```
-src/KestrelCache/            the engines: Bitcask, LSM, shared abstractions
-src/KestrelCache.Server/     RESP server, command table, metrics endpoint
-src/KestrelCache.Raft/       consensus: log, state, transport, node
-src/KestrelCache.Cli/        a CLI, and the crash-test harness
-tests/KestrelCache.Tests/    250 tests
-benchmarks/                  latency percentiles and cross-engine comparison
-deploy/                      compose stacks, Prometheus config, Grafana dashboard
-docs/DESIGN.md               why, what was measured, and what is still missing
+src/KestrelCache/              the storage engines
+  Abstractions/                  IStorageEngine, WriteBatch, options, stats
+  Bitcask/                       append-only log + in-memory hash index
+  Lsm/                           WAL, memtable, SSTables, compaction, snapshots
+  Internal/                      positional I/O helpers
+
+src/KestrelCache.Raft/         consensus
+  Consensus/                     the node, messages, options, recovery
+  Log/                           replicated log, persistent state, snapshots
+  Membership/                    configurations and joint consensus
+  Transport/                     TCP transport, RPC server, wire format,
+                                 and the in-process network the tests drive
+
+src/KestrelCache.Server/       RESP server
+  Resp/                          protocol parsing and writing
+  Commands/                      the command table
+  Observability/                 Prometheus metrics, health, stats
+
+src/KestrelCache.Cli/          a CLI, and the crash-test harness
+
+tests/KestrelCache.Tests/      278 tests
+  Engines/                       engine behaviour, fuzzing, corruption, crashes
+  Server/                        RESP protocol over a real socket
+  Consensus/                     elections, replication, snapshots, membership
+
+benchmarks/                    latency percentiles and cross-engine comparison
+deploy/                        compose stacks, Prometheus config, Grafana dashboard
+docs/DESIGN.md                 storage: why, what was measured, what is missing
+docs/REPLICATION.md            consensus: Raft, snapshots, membership changes
+CHANGELOG.md                   what changed, and which bug each change fixed
 ```
+
+Build configuration is centralised: `Directory.Build.props` for shared properties,
+`Directory.Packages.props` for every dependency version in one place, `global.json` to pin the
+SDK.
 
 ---
 
@@ -185,6 +214,28 @@ redis-cli -p 6382 get replicated          # followers serve reads
 docker compose -f deploy/docker-compose.cluster.yml kill kc1
 redis-cli -p 6382 cluster info            # a new leader within an election timeout
 ```
+
+### Growing, shrinking and compacting a live cluster
+
+```bash
+# Truncate the Raft log behind a snapshot
+redis-cli -p 6381 cluster snapshot
+# -> snapshot at index 301; log [1..301] -> [302..301], 7,058 byte(s)
+
+# Start a fourth node that joins rather than bootstrapping, then admit it
+kestrel-server --raft-id n4 --raft-join --raft-port 7384 --port 6384 --data ./d4 \
+  --raft-peers n1=127.0.0.1:7381,n2=127.0.0.1:7382,n3=127.0.0.1:7383,n4=127.0.0.1:7384
+
+redis-cli -p 6381 cluster addnode n4 127.0.0.1:7384
+redis-cli -p 6384 get key:150     # a key written before n4 existed; arrived via the snapshot
+
+redis-cli -p 6381 cluster removenode n2
+```
+
+A node added at runtime, whose entire state arrived as a snapshot because the leader had already
+discarded its log, goes on to win an election and serve writes under the new membership. That
+exchange is reproduced verbatim in
+[docs/REPLICATION.md](docs/REPLICATION.md#verified-on-a-real-cluster-1).
 
 ### Using it as a library
 
@@ -237,20 +288,37 @@ same lock and issued its own syscall, so the lock *was* the queue. Group commit 
 49,456 to 82,440/s while simultaneously moving from no fsync to interval fsync.
 [Details](docs/DESIGN.md#writes-serialise-and-group-commit-makes-that-cheap)
 
+**A removed cluster member that drove a settled cluster from term 1 to term 22.** Dropping a
+server the instant it is removed leaves it believing it is still a voter, so it campaigns forever
+against a cluster it is no longer part of. It cannot win, but it can be endlessly disruptive. The
+leader now keeps replicating to a departed server until it acknowledges the entry that removed it.
+[Details](docs/REPLICATION.md#a-removed-server-has-to-be-told)
+
+**A diagnostic that destroyed what it measured.** The test written to find the Raft bugs read each
+node's log by reopening the file — and replay truncates a torn tail, so inspecting a live node's
+log *shortened* it. It reported followers holding two entries out of twenty-six, having caused the
+divergence it was looking for.
+[Details](docs/REPLICATION.md#a-diagnostic-that-destroyed-what-it-measured)
+
 ---
 
 ## Status and limitations
 
 Working and tested: both engines, durability policies, compaction, MVCC snapshots, ordered scans,
-the RESP server, Prometheus metrics, and Raft replication with failover and catch-up.
+the RESP server, Prometheus metrics, and Raft replication with failover, catch-up, log snapshotting
+and live membership changes.
 
 Known gaps, stated plainly:
 
 - **Reads on a follower may be stale.** Read-your-writes holds against the leader; cluster-wide
   linearizability would need ReadIndex.
-- **Cluster membership is fixed at startup.** Adding or removing a node needs Raft's
-  joint-consensus protocol.
-- **The Raft log grows without bound.** No snapshotting or log truncation yet.
+- **No pre-vote phase.** A partitioned node that rejoins can force a term increment and a needless
+  election.
+- **No learner members.** A joining server becomes a voter immediately, so it counts toward
+  quorums while still catching up. Real implementations promote a non-voting learner once it is
+  current.
+- **A replicated node must use the LSM engine.** Snapshotting requires enumerating the keyspace,
+  which a hash index cannot do.
 - **No collection types and no `EXPIRE`.** The engine stores opaque bytes and no record carries a
   timestamp. Unsupported commands and options are refused rather than silently ignored.
 - **This is a learning project, not production software.** It has not been run in anger, fuzzed by

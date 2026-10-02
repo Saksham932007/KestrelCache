@@ -28,14 +28,64 @@ public sealed class ReplicatedEngine : IScannableStorageEngine
     private readonly ReplicatedStore _store;
     private readonly RaftNode _node;
 
+    private readonly IRaftPeerDirectory? _directory;
+
     /// <summary>Wraps a replicated store as an engine.</summary>
-    public ReplicatedEngine(ReplicatedStore store, RaftNode node)
+    /// <param name="store">The replicated state machine.</param>
+    /// <param name="node">The consensus node.</param>
+    /// <param name="directory">
+    /// Where peer addresses are registered, so a server added at runtime can be reached. Null
+    /// when the transport needs no addresses, as with an in-process network.
+    /// </param>
+    public ReplicatedEngine(
+        ReplicatedStore store,
+        RaftNode node,
+        IRaftPeerDirectory? directory = null)
     {
         ArgumentNullException.ThrowIfNull(store);
         ArgumentNullException.ThrowIfNull(node);
         _store = store;
         _node = node;
+        _directory = directory;
     }
+
+    /// <summary>Peers this node knows how to reach, when the transport tracks addresses.</summary>
+    public IReadOnlyCollection<RaftPeerAddress> KnownPeers => _directory?.Peers ?? [];
+
+    /// <summary>
+    /// Adds a server to the cluster, registering its address first so it can be reached.
+    /// </summary>
+    /// <remarks>
+    /// The order matters. Appending the configuration entry before the address is known would
+    /// leave the leader unable to replicate to the very server it has just made a voter, so the
+    /// joint entry could never commit and the change would wedge.
+    /// </remarks>
+    public async Task AddServerAsync(
+        RaftPeerAddress address,
+        CancellationToken cancellationToken = default)
+    {
+        _directory?.AddPeer(address);
+        await _node.AddServerAsync(address.NodeId, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>Removes a server from the cluster.</summary>
+    /// <remarks>
+    /// The address is forgotten only after the change has committed. Dropping it first would
+    /// stop the leader replicating the very entry that tells the departing server it has been
+    /// removed — leaving it to campaign indefinitely against a cluster it is no longer part of.
+    /// </remarks>
+    public async Task RemoveServerAsync(
+        string nodeId,
+        CancellationToken cancellationToken = default)
+    {
+        await _node.RemoveServerAsync(nodeId, cancellationToken).ConfigureAwait(false);
+        _directory?.RemovePeer(nodeId);
+    }
+
+    /// <summary>Captures a snapshot and discards the log prefix it replaces.</summary>
+    public Task<RaftSnapshotMetadata?> CreateSnapshotAsync(
+        CancellationToken cancellationToken = default) =>
+        _node.CreateSnapshotAsync(cancellationToken);
 
     /// <inheritdoc />
     public string Name => $"raft+{_store.Engine.Name}";

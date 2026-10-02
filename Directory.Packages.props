@@ -1,0 +1,33 @@
+<Project>
+
+  <!--
+    Central package management: every version lives here, and project files reference packages
+    without one. Two reasons. It makes a version mismatch between projects impossible rather than
+    merely unlikely, which matters most for the test and analyzer packages that have to agree.
+    And it puts every dependency this repository has on one screen, which is the first thing
+    anyone auditing it wants to see.
+  -->
+  <PropertyGroup>
+    <ManagePackageVersionsCentrally>true</ManagePackageVersionsCentrally>
+    <CentralPackageTransitivePinningEnabled>true</CentralPackageTransitivePinningEnabled>
+  </PropertyGroup>
+
+  <ItemGroup Label="Runtime">
+    <!-- CRC-32 and XxHash3, used for record checksums and the Bloom filter. -->
+    <PackageVersion Include="System.IO.Hashing" Version="9.0.9" />
+  </ItemGroup>
+
+  <ItemGroup Label="Testing">
+    <PackageVersion Include="Microsoft.NET.Test.Sdk" Version="17.11.1" />
+    <PackageVersion Include="xunit" Version="2.9.2" />
+    <PackageVersion Include="xunit.runner.visualstudio" Version="2.8.2" />
+    <PackageVersion Include="FsCheck.Xunit" Version="2.16.6" />
+    <PackageVersion Include="Xunit.SkippableFact" Version="1.5.23" />
+    <PackageVersion Include="coverlet.collector" Version="6.0.2" />
+  </ItemGroup>
+
+  <ItemGroup Label="Benchmarking">
+    <PackageVersion Include="BenchmarkDotNet" Version="0.14.0" />
+  </ItemGroup>
+
+</Project>

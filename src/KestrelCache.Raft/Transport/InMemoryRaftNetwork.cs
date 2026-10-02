@@ -162,6 +162,29 @@ public sealed class InMemoryRaftNetwork
             return response;
         }
 
+        public async Task<InstallSnapshotResponse?> InstallSnapshotAsync(
+            string peerId,
+            InstallSnapshotRequest request,
+            CancellationToken cancellationToken)
+        {
+            if (!await network.TravelAsync(from, peerId, cancellationToken).ConfigureAwait(false))
+            {
+                return null;
+            }
+
+            if (!network._nodes.TryGetValue(peerId, out var peer)) return null;
+
+            var response = await peer.HandleInstallSnapshotAsync(request, cancellationToken)
+                .ConfigureAwait(false);
+
+            if (!await network.TravelAsync(peerId, from, cancellationToken).ConfigureAwait(false))
+            {
+                return null;
+            }
+
+            return response;
+        }
+
         public async Task<AppendEntriesResponse?> AppendEntriesAsync(
             string peerId,
             AppendEntriesRequest request,

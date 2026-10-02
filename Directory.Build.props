@@ -13,7 +13,6 @@
     <Authors>Saksham Kapoor</Authors>
     <Product>KestrelCache</Product>
     <RepositoryUrl>https://github.com/Saksham932007/KestrelCache</RepositoryUrl>
-    <ManagePackageVersionsCentrally>false</ManagePackageVersionsCentrally>
   </PropertyGroup>
 
 </Project>

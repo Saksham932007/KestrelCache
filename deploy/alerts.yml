@@ -62,6 +62,70 @@ groups:
         annotations:
           summary: "Bloom filter false-positive rate above 5%"
 
+      - alert: NoRaftLeader
+        # No leader means no writes. A brief gap during an election is normal; a sustained one
+        # means a quorum cannot be assembled.
+        expr: max(kestrelcache_raft_enabled) == 1 and max(kestrelcache_raft_is_leader) == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "The cluster has no leader and cannot accept writes"
+
+      - alert: TwoRaftLeaders
+        # Should be impossible: one leader per term is the guarantee the protocol is built on.
+        # Alerting on it anyway, because if it ever fires the cluster has diverged and no amount
+        # of waiting will fix it.
+        expr: sum(kestrelcache_raft_is_leader) > 1
+        for: 30s
+        labels:
+          severity: critical
+        annotations:
+          summary: "More than one node reports itself leader; the cluster has diverged"
+
+      - alert: RaftTermChurn
+        # Terms climbing with no failures means something is repeatedly disrupting elections --
+        # classically a removed server that does not know it was removed, or a flapping link.
+        expr: increase(kestrelcache_raft_elections_started_total[10m]) > 10
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.node }} has started {{ $value }} elections in ten minutes"
+
+      - alert: MembershipChangeStuck
+        # A change that never leaves the joint phase leaves the cluster permanently requiring two
+        # majorities, so it tolerates fewer failures than either configuration alone.
+        expr: max(kestrelcache_raft_membership_change_in_progress) == 1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "A membership change has been in its joint phase for five minutes"
+
+      - alert: RaftLogUnbounded
+        # Snapshotting is what keeps the log finite. A log growing past its threshold without a
+        # snapshot being taken means the mechanism has stopped working.
+        expr: |
+          max(kestrelcache_raft_log_entries) > 50000
+          and increase(kestrelcache_raft_snapshots_taken_total[30m]) == 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "The Raft log has {{ $value }} entries and no snapshot has been taken"
+
+      - alert: FollowerFallingBehind
+        # A follower whose acknowledged index trails the leader's commit index far enough will
+        # eventually need a full snapshot rather than incremental catch-up.
+        expr: |
+          max(kestrelcache_raft_commit_index) - min(kestrelcache_raft_peer_match_index) > 10000
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "A follower is {{ $value }} entries behind the leader"
+
       - alert: NoCompactionProgress
         # Write-heavy but compaction has stopped: either it is wedged or it has failed, and
         # either way the tree only gets worse from here.

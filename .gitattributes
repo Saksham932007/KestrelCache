@@ -1,0 +1,23 @@
+# Normalise line endings in the repository, and check out whatever the platform expects.
+# Without this, a Windows contributor's commit rewrites every line of every file it touches and
+# the diff becomes unreadable.
+* text=auto eol=lf
+
+*.cs      text diff=csharp
+*.csproj  text
+*.props   text
+*.sln     text eol=crlf
+*.md      text
+*.yml     text
+*.yaml    text
+*.json    text
+Dockerfile text
+*.sh      text eol=lf
+
+# Binary, so git never tries to merge or diff them as text.
+*.png     binary
+*.jpg     binary
+*.ico     binary
+*.sst     binary
+*.wal     binary
+*.kc      binary

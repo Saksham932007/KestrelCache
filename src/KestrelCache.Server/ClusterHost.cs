@@ -49,10 +49,11 @@ public sealed class ClusterHost : IAsyncDisposable
     {
         var addresses = options.RaftPeers.Select(RaftPeerAddress.Parse).ToList();
 
-        if (addresses.All(a => a.NodeId != options.RaftNodeId))
+        if (!options.RaftJoin && addresses.All(a => a.NodeId != options.RaftNodeId))
         {
             throw new ArgumentException(
-                $"--raft-peers must include this node ('{options.RaftNodeId}'); got "
+                $"--raft-peers must include this node ('{options.RaftNodeId}') unless "
+                    + "--raft-join is given; got "
                     + string.Join(", ", addresses.Select(a => a.NodeId)),
                 nameof(options));
         }
@@ -60,7 +61,10 @@ public sealed class ClusterHost : IAsyncDisposable
         var raftOptions = new RaftOptions
         {
             NodeId = options.RaftNodeId!,
-            Peers = [.. addresses.Select(a => a.NodeId)],
+
+            // Empty for a joining server: it learns the membership from the leader, and until
+            // then has no voters to count a majority against, so it cannot elect itself.
+            Peers = options.BootstrapVoters,
             DataDirectory = Path.Combine(
                 Path.GetFullPath(options.DataPath) + "-raft", options.RaftNodeId!),
             ElectionTimeout = options.RaftElectionTimeout,
@@ -68,6 +72,8 @@ public sealed class ClusterHost : IAsyncDisposable
             Trace = trace,
         };
 
+        // A joining server still needs everyone's address, even though it is not yet a voter --
+        // it will have to replicate and vote as soon as it is admitted.
         var transport = new TcpRaftTransport(addresses);
         var store = new ReplicatedStore(localEngine, ownsEngine: true);
         var node = new RaftNode(raftOptions, transport, store);
@@ -76,7 +82,8 @@ public sealed class ClusterHost : IAsyncDisposable
         var rpcServer = new RaftRpcServer(node, options.BindAddress, options.RaftPort);
         rpcServer.Bind();
 
-        var host = new ClusterHost(new ReplicatedEngine(store, node), node, rpcServer, transport);
+        var host = new ClusterHost(
+            new ReplicatedEngine(store, node, transport), node, rpcServer, transport);
 
         // Accept peer traffic before campaigning. See the remarks on this type.
         host._serving = rpcServer.RunAsync(host._shutdown.Token);

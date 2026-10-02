@@ -11,6 +11,8 @@ internal enum RaftMessageKind : byte
     RequestVoteResponse = 2,
     AppendEntriesRequest = 3,
     AppendEntriesResponse = 4,
+    InstallSnapshotRequest = 5,
+    InstallSnapshotResponse = 6,
 }
 
 /// <summary>
@@ -141,7 +143,7 @@ internal static class RaftWire
             {
                 writer.Write(entry.Index);
                 writer.Write(entry.Term);
-                writer.Write(entry.IsNoOp);
+                writer.Write((byte)entry.Kind);
                 writer.Write(entry.Command.Length);
                 writer.Write(entry.Command);
             }
@@ -167,7 +169,7 @@ internal static class RaftWire
         {
             long index = reader.ReadInt64();
             long entryTerm = reader.ReadInt64();
-            bool isNoOp = reader.ReadBoolean();
+            byte kind = reader.ReadByte();
             int length = reader.ReadInt32();
 
             if (length < 0 || length > MaxFrameSize)
@@ -175,7 +177,13 @@ internal static class RaftWire
                 throw new CorruptRecordException($"Implausible command length {length}.", 0, peer);
             }
 
-            entries.Add(new RaftLogEntry(index, entryTerm, reader.ReadBytes(length), isNoOp));
+            if (!Enum.IsDefined((RaftEntryKind)kind))
+            {
+                throw new CorruptRecordException($"Unknown log entry kind {kind}.", 0, peer);
+            }
+
+            entries.Add(new RaftLogEntry(
+                index, entryTerm, (RaftEntryKind)kind, reader.ReadBytes(length)));
         }
 
         return new AppendEntriesRequest(
@@ -192,6 +200,82 @@ internal static class RaftWire
             writer.Write(response.ConflictTerm);
             writer.Write(response.ConflictIndex);
         });
+
+    internal static byte[] Encode(InstallSnapshotRequest request)
+    {
+        long term = request.Term;
+        string leaderId = request.LeaderId;
+        long lastIncludedIndex = request.LastIncludedIndex;
+        long lastIncludedTerm = request.LastIncludedTerm;
+        byte[] configuration = request.Configuration;
+        long offset = request.Offset;
+        byte[] data = request.Data;
+        bool done = request.Done;
+
+        return Frame(RaftMessageKind.InstallSnapshotRequest, writer =>
+        {
+            writer.Write(term);
+            writer.Write(leaderId);
+            writer.Write(lastIncludedIndex);
+            writer.Write(lastIncludedTerm);
+            writer.Write(configuration.Length);
+            writer.Write(configuration);
+            writer.Write(offset);
+            writer.Write(done);
+            writer.Write(data.Length);
+            writer.Write(data);
+        });
+    }
+
+    internal static InstallSnapshotRequest DecodeInstallSnapshotRequest(
+        BinaryReader reader,
+        string? peer)
+    {
+        long term = reader.ReadInt64();
+        string leaderId = reader.ReadString();
+        long lastIncludedIndex = reader.ReadInt64();
+        long lastIncludedTerm = reader.ReadInt64();
+
+        int configLength = reader.ReadInt32();
+        if (configLength is < 0 or > 1024 * 1024)
+        {
+            throw new CorruptRecordException(
+                $"Implausible configuration length {configLength}.", 0, peer);
+        }
+        byte[] configuration = reader.ReadBytes(configLength);
+
+        long offset = reader.ReadInt64();
+        bool done = reader.ReadBoolean();
+
+        int dataLength = reader.ReadInt32();
+        if (dataLength < 0 || dataLength > MaxFrameSize)
+        {
+            throw new CorruptRecordException(
+                $"Implausible snapshot chunk length {dataLength}.", 0, peer);
+        }
+
+        return new InstallSnapshotRequest(
+            term,
+            leaderId,
+            lastIncludedIndex,
+            lastIncludedTerm,
+            configuration,
+            offset,
+            reader.ReadBytes(dataLength),
+            done);
+    }
+
+    internal static byte[] Encode(InstallSnapshotResponse response) =>
+        Frame(RaftMessageKind.InstallSnapshotResponse, writer =>
+        {
+            writer.Write(response.Term);
+            writer.Write(response.FollowerId);
+            writer.Write(response.BytesReceived);
+            writer.Write(response.Success);
+        });
+
+    internal static InstallSnapshotResponse DecodeInstallSnapshotResponse(BinaryReader reader) =>
+        new(reader.ReadInt64(), reader.ReadString(), reader.ReadInt64(), reader.ReadBoolean());
 
     internal static AppendEntriesResponse DecodeAppendEntriesResponse(BinaryReader reader) =>
         new(

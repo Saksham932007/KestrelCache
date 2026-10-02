@@ -277,6 +277,84 @@ jobs:
           echo "no new leader was elected after the old one was killed"
           exit 1
 
+      - name: Snapshotting truncates the log and keeps the data
+        run: |
+          cli() { docker run --rm --network host redis:7-alpine redis-cli "$@"; }
+          for i in $(seq 1 200); do cli -p "$LEADER_PORT" SET "key:$i" "value-$i" > /dev/null; done
+
+          before=$(cli -p "$LEADER_PORT" CLUSTER INFO | grep -oP 'log_entries:\K[0-9]+')
+          cli -p "$LEADER_PORT" CLUSTER SNAPSHOT
+          after=$(cli -p "$LEADER_PORT" CLUSTER INFO | grep -oP 'log_entries:\K[0-9]+')
+          snapshot=$(cli -p "$LEADER_PORT" CLUSTER INFO | grep -oP 'snapshot_index:\K[0-9]+')
+
+          echo "log entries $before -> $after, snapshot at index $snapshot"
+          test "$after" -lt "$before" || { echo "the log was not truncated"; exit 1; }
+          test "$snapshot" -gt 0 || { echo "no snapshot was taken"; exit 1; }
+
+          # The whole point: truncating the history must not lose the state it produced.
+          test "$(cli -p "$LEADER_PORT" GET key:1)" = "value-1"
+          test "$(cli -p "$LEADER_PORT" GET key:200)" = "value-200"
+          echo "snapshotting verified"
+
+      # A server added after the leader has discarded its log can only be caught up by a state
+      # transfer, so this exercises InstallSnapshot as well as joint consensus.
+      - name: A server can join a running cluster and is caught up by a snapshot
+        run: |
+          cli() { docker run --rm --network host redis:7-alpine redis-cli "$@"; }
+
+          docker compose -f deploy/docker-compose.cluster.yml --profile grow \
+            up -d --wait --wait-timeout 120 kc4
+
+          # No voters until it is admitted, so it cannot elect itself.
+          voters=$(cli -p 6384 CLUSTER INFO | grep -oP 'voters:\K.*' || true)
+          echo "n4 voters before joining: '${voters}'"
+          test -z "$(echo "$voters" | tr -d '[:space:]')" \
+            || { echo "a joining server must start with no voters"; exit 1; }
+
+          cli -p "$LEADER_PORT" CLUSTER ADDNODE n4 kc4:7380
+
+          for i in $(seq 1 60); do
+            got=$(cli -p 6384 CLUSTER INFO | grep -oP 'voters:\K.*' | tr -d '[:space:]')
+            case "$got" in *n4*) break ;; esac
+            sleep 2
+          done
+
+          cli -p 6384 CLUSTER INFO | grep -E 'role|voters|snapshot_index|snapshots_installed'
+
+          installed=$(cli -p 6384 CLUSTER INFO | grep -oP 'snapshots_installed:\K[0-9]+')
+          test "$installed" -gt 0 || { echo "n4 was not caught up by a snapshot"; exit 1; }
+
+          # Data written long before n4 existed, which can only have arrived in the snapshot.
+          test "$(cli -p 6384 GET key:1)" = "value-1"
+          test "$(cli -p 6384 GET key:200)" = "value-200"
+          echo "runtime join verified"
+
+      - name: A server can be removed from a running cluster
+        run: |
+          cli() { docker run --rm --network host redis:7-alpine redis-cli "$@"; }
+
+          # Remove a node that is not the leader, so the removal itself does not trigger an
+          # election mid-test.
+          case "$LEADER_PORT" in
+            6381) victim=n2 ;; *) victim=n1 ;;
+          esac
+
+          cli -p "$LEADER_PORT" CLUSTER REMOVENODE "$victim"
+
+          for i in $(seq 1 60); do
+            got=$(cli -p "$LEADER_PORT" CLUSTER INFO | grep -oP 'voters:\K.*' | tr -d '[:space:]')
+            case "$got" in *"$victim"*) sleep 2 ;; *) echo "voters are now $got"; break ;; esac
+          done
+
+          got=$(cli -p "$LEADER_PORT" CLUSTER INFO | grep -oP 'voters:\K.*' | tr -d '[:space:]')
+          case "$got" in
+            *"$victim"*) echo "$victim is still a voter"; exit 1 ;;
+          esac
+
+          # The smaller cluster still accepts writes.
+          test "$(cli -p "$LEADER_PORT" SET afterRemoval yes)" = "OK"
+          echo "runtime removal verified"
+
       - name: Dump logs on failure
         if: failure()
         run: docker compose -f deploy/docker-compose.cluster.yml logs

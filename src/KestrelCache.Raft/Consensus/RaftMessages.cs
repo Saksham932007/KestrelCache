@@ -13,12 +13,38 @@ public enum RaftRole
     Leader,
 }
 
+/// <summary>What a log entry represents.</summary>
+/// <remarks>
+/// A single byte rather than a pair of booleans, because the set is closed and mutually
+/// exclusive: an entry is exactly one of these three things. The earlier version carried an
+/// <c>IsNoOp</c> flag, which worked until configuration entries arrived and a second boolean
+/// would have admitted the nonsensical combination of both.
+/// </remarks>
+public enum RaftEntryKind : byte
+{
+    /// <summary>An opaque state-machine command.</summary>
+    Command = 0,
+
+    /// <summary>
+    /// The entry a new leader appends on election, carrying no payload. See
+    /// <see cref="RaftLogEntry"/> for why it exists.
+    /// </summary>
+    NoOp = 1,
+
+    /// <summary>
+    /// A cluster configuration. Applied to the consensus module rather than the state machine,
+    /// and takes effect when appended rather than when committed.
+    /// </summary>
+    Configuration = 2,
+}
+
 /// <summary>One entry in the replicated log.</summary>
 /// <param name="Index">Position in the log, starting at 1.</param>
 /// <param name="Term">The term of the leader that created this entry.</param>
-/// <param name="Command">The opaque state-machine command, or empty for a no-op.</param>
-/// <param name="IsNoOp">
-/// True for the entry a new leader appends immediately on election.
+/// <param name="Kind">What this entry represents.</param>
+/// <param name="Command">
+/// The state-machine command for <see cref="RaftEntryKind.Command"/>, the encoded configuration
+/// for <see cref="RaftEntryKind.Configuration"/>, and empty for a no-op.
 /// </param>
 /// <remarks>
 /// <para>
@@ -37,14 +63,35 @@ public enum RaftRole
 /// everything before it, so the stale prefix becomes committed safely as a side effect.
 /// </para>
 /// </remarks>
-public readonly record struct RaftLogEntry(long Index, long Term, byte[] Command, bool IsNoOp)
+public readonly record struct RaftLogEntry(
+    long Index,
+    long Term,
+    RaftEntryKind Kind,
+    byte[] Command)
 {
+    /// <summary>True when this entry carries no state-machine command.</summary>
+    public bool IsNoOp => Kind == RaftEntryKind.NoOp;
+
+    /// <summary>True when this entry carries a cluster configuration.</summary>
+    public bool IsConfiguration => Kind == RaftEntryKind.Configuration;
+
     /// <summary>Creates a client command entry.</summary>
     public static RaftLogEntry Command_(long index, long term, byte[] command) =>
-        new(index, term, command, IsNoOp: false);
+        new(index, term, RaftEntryKind.Command, command);
 
     /// <summary>Creates the no-op entry a new leader appends on election.</summary>
-    public static RaftLogEntry NoOp(long index, long term) => new(index, term, [], IsNoOp: true);
+    public static RaftLogEntry NoOp(long index, long term) =>
+        new(index, term, RaftEntryKind.NoOp, []);
+
+    /// <summary>Creates a configuration entry.</summary>
+    public static RaftLogEntry Configuration(long index, long term, RaftConfiguration configuration) =>
+        new(index, term, RaftEntryKind.Configuration, RaftConfigurationCodec.Encode(configuration));
+
+    /// <summary>Decodes the configuration this entry carries.</summary>
+    public RaftConfiguration AsConfiguration() =>
+        Kind == RaftEntryKind.Configuration
+            ? RaftConfigurationCodec.Decode(Command)
+            : throw new InvalidOperationException($"This entry is a {Kind}, not a configuration.");
 }
 
 /// <summary>A candidate's request for a vote.</summary>
@@ -110,6 +157,57 @@ public readonly record struct AppendEntriesResponse(
     long ConflictIndex);
 
 /// <summary>
+/// A leader sending a snapshot to a follower that has fallen too far behind.
+/// </summary>
+/// <param name="Term">The leader's term.</param>
+/// <param name="LeaderId">Who is leading.</param>
+/// <param name="LastIncludedIndex">The snapshot replaces every entry up to and including this index.</param>
+/// <param name="LastIncludedTerm">Term of the entry at <paramref name="LastIncludedIndex"/>.</param>
+/// <param name="Configuration">
+/// The cluster configuration as of the snapshot, encoded. Carried because the log entries that
+/// established it may have been discarded.
+/// </param>
+/// <param name="Offset">Byte offset of this chunk within the snapshot.</param>
+/// <param name="Data">This chunk's bytes.</param>
+/// <param name="Done">True on the final chunk, which is what triggers installation.</param>
+/// <remarks>
+/// <para>
+/// This RPC exists because of a gap that opens the moment a log can be truncated. A follower
+/// that is far behind — a new server, or one that was down for a while — needs entries the
+/// leader has already discarded, so <c>AppendEntries</c> can never succeed for it no matter how
+/// far back <c>nextIndex</c> is wound. The leader has to send the state itself rather than the
+/// history that produced it.
+/// </para>
+/// <para>
+/// Sent in chunks rather than one message, because a snapshot is the size of the entire dataset.
+/// A single frame would mean buffering all of it on both sides and would make one lost packet
+/// cost the whole transfer.
+/// </para>
+/// </remarks>
+public readonly record struct InstallSnapshotRequest(
+    long Term,
+    string LeaderId,
+    long LastIncludedIndex,
+    long LastIncludedTerm,
+    byte[] Configuration,
+    long Offset,
+    byte[] Data,
+    bool Done);
+
+/// <summary>A reply to <see cref="InstallSnapshotRequest"/>.</summary>
+/// <param name="Term">The responder's term.</param>
+/// <param name="FollowerId">Who replied.</param>
+/// <param name="BytesReceived">
+/// How much of the snapshot the follower now holds, so the leader knows where to resume.
+/// </param>
+/// <param name="Success">False when the request was rejected, e.g. for a stale term.</param>
+public readonly record struct InstallSnapshotResponse(
+    long Term,
+    string FollowerId,
+    long BytesReceived,
+    bool Success);
+
+/// <summary>
 /// How a node reaches its peers. Abstracted so that tests can replace the network.
 /// </summary>
 /// <remarks>
@@ -133,6 +231,12 @@ public interface IRaftTransport
         string peerId,
         AppendEntriesRequest request,
         CancellationToken cancellationToken);
+
+    /// <summary>Sends one chunk of a snapshot to <paramref name="peerId"/>.</summary>
+    Task<InstallSnapshotResponse?> InstallSnapshotAsync(
+        string peerId,
+        InstallSnapshotRequest request,
+        CancellationToken cancellationToken);
 }
 
 /// <summary>
@@ -152,4 +256,24 @@ public interface IRaftStateMachine
     /// concurrently with itself.
     /// </summary>
     ValueTask ApplyAsync(RaftLogEntry entry, CancellationToken cancellationToken);
+
+    /// <summary>
+    /// Writes the complete current state to <paramref name="destination"/>.
+    /// </summary>
+    /// <remarks>
+    /// Called with the state machine quiesced, so the result is a consistent image of everything
+    /// applied up to the snapshot's index. The format is entirely the state machine's business:
+    /// Raft treats it as opaque bytes, exactly as it treats commands.
+    /// </remarks>
+    ValueTask CaptureSnapshotAsync(Stream destination, CancellationToken cancellationToken);
+
+    /// <summary>
+    /// Replaces the entire current state with the image in <paramref name="source"/>.
+    /// </summary>
+    /// <remarks>
+    /// This must <i>replace</i> rather than merge. A follower receiving a snapshot may hold state
+    /// from entries that were never committed and have since been overwritten, and leaving those
+    /// behind would leave it permanently divergent from the leader.
+    /// </remarks>
+    ValueTask RestoreSnapshotAsync(Stream source, CancellationToken cancellationToken);
 }

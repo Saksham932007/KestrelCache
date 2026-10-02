@@ -17,6 +17,9 @@ scrape_configs:
       - targets: ["kestrelcache:9180"]
         labels:
           instance: kestrelcache
+          # Labelled even for a single node, so the same dashboard works unchanged against the
+          # clustered stack, where every panel breaks down by node.
+          node: single
 
   - job_name: prometheus
     static_configs:

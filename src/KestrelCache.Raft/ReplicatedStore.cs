@@ -1,3 +1,5 @@
+using System.Text;
+
 namespace KestrelCache.Raft;
 
 /// <summary>
@@ -155,6 +157,162 @@ public sealed class ReplicatedStore : IRaftStateMachine, IAsyncDisposable
         // entry twice reaches the same state as applying it once. Raft replays from lastApplied
         // on restart, and this is why that replay cannot corrupt anything.
         await _engine.WriteAsync(batch, cancellationToken).ConfigureAwait(false);
+    }
+
+    // ---------------------------------------------------------------- snapshots
+
+    private const ushort SnapshotFormatVersion = 1;
+
+    /// <summary>
+    /// Writes every live key-value pair as the state-machine image.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Streamed rather than buffered, because the image is the size of the whole dataset and the
+    /// point of snapshotting is to handle datasets too large to keep replaying. A length-prefixed
+    /// pair-per-record format, so the reader never has to guess where a record ends.
+    /// </para>
+    /// <para>
+    /// This needs the engine to iterate in order, which is why a replicated cluster requires the
+    /// LSM engine. A hash index cannot enumerate its keyspace without sorting it first, so a
+    /// Bitcask-backed node could be replicated but never snapshotted — and a Raft log that can
+    /// never be truncated grows until the disk fills.
+    /// </para>
+    /// </remarks>
+    public async ValueTask CaptureSnapshotAsync(
+        Stream destination,
+        CancellationToken cancellationToken)
+    {
+        if (_engine is not IScannableStorageEngine scannable)
+        {
+            throw new NotSupportedException(
+                $"The {_engine.Name} engine cannot enumerate its keyspace, so it cannot be "
+                    + "snapshotted. Use the LSM engine for a replicated node.");
+        }
+
+        var writer = new BinaryWriter(destination, Encoding.UTF8, leaveOpen: true);
+        writer.Write(SnapshotFormatVersion);
+
+        // The pair count is unknown until the scan finishes, so a terminator is used instead of
+        // a header count -- which also means the capture never has to buffer or two-pass.
+        long pairs = 0;
+
+        await foreach (var (key, value) in scannable
+            .ScanAsync(cancellationToken: cancellationToken)
+            .ConfigureAwait(false))
+        {
+            writer.Write(key.Length);
+            writer.Write(key);
+            writer.Write(value.Length);
+            writer.Write(value);
+            pairs++;
+        }
+
+        writer.Write(-1); // terminator: a negative key length cannot occur in a real record
+        writer.Write(pairs);
+        writer.Flush();
+    }
+
+    /// <summary>
+    /// Replaces the engine's entire contents with the image in <paramref name="source"/>.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// A replacement, not a merge, and the difference matters. A follower receiving a snapshot
+    /// may hold keys from entries that were never committed and have since been overwritten by a
+    /// different leader; merging would leave those keys behind and the node permanently divergent
+    /// from the rest of the cluster. So every existing key not present in the snapshot is
+    /// deleted.
+    /// </para>
+    /// <para>
+    /// Not atomic with respect to a crash midway through. That is survivable rather than ignored:
+    /// the snapshot file is installed before the restore begins and the node's applied index is
+    /// only advanced after it completes, so a crash leaves the snapshot on disk and the restore
+    /// is simply re-run on the next start. Idempotence is what makes that safe — the restore
+    /// computes the same final state however many times it runs.
+    /// </para>
+    /// </remarks>
+    public async ValueTask RestoreSnapshotAsync(Stream source, CancellationToken cancellationToken)
+    {
+        using var reader = new BinaryReader(source, Encoding.UTF8, leaveOpen: true);
+
+        ushort version = reader.ReadUInt16();
+        if (version != SnapshotFormatVersion)
+        {
+            throw new CorruptRecordException(
+                $"State-machine snapshot format version {version} is not supported by this build "
+                    + $"(expected {SnapshotFormatVersion}).",
+                0);
+        }
+
+        var restored = new HashSet<byte[]>(ByteKeyComparer.Instance);
+        var batch = new WriteBatch();
+
+        while (true)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+
+            int keyLength = reader.ReadInt32();
+            if (keyLength < 0) break; // terminator
+
+            if (keyLength == 0 || keyLength > 64 * 1024 * 1024)
+            {
+                throw new CorruptRecordException(
+                    $"Implausible key length {keyLength} in a state-machine snapshot.", 0);
+            }
+
+            byte[] key = reader.ReadBytes(keyLength);
+
+            int valueLength = reader.ReadInt32();
+            if (valueLength < 0 || valueLength > 64 * 1024 * 1024)
+            {
+                throw new CorruptRecordException(
+                    $"Implausible value length {valueLength} in a state-machine snapshot.", 0);
+            }
+
+            byte[] value = reader.ReadBytes(valueLength);
+
+            restored.Add(key);
+            batch.Put(key, value);
+
+            if (batch.Count >= 1_000)
+            {
+                await _engine.WriteAsync(batch, cancellationToken).ConfigureAwait(false);
+                batch.Clear();
+            }
+        }
+
+        if (batch.Count > 0)
+        {
+            await _engine.WriteAsync(batch, cancellationToken).ConfigureAwait(false);
+            batch.Clear();
+        }
+
+        // Now remove anything the snapshot does not contain. Done second so that a crash between
+        // the two phases leaves a superset of the correct state rather than a subset -- extra
+        // keys are repaired by re-running the restore, whereas missing ones would need the
+        // snapshot again.
+        if (_engine is IScannableStorageEngine scannable)
+        {
+            await foreach (var (key, _) in scannable
+                .ScanAsync(cancellationToken: cancellationToken)
+                .ConfigureAwait(false))
+            {
+                if (restored.Contains(key)) continue;
+
+                batch.Delete(key);
+                if (batch.Count >= 1_000)
+                {
+                    await _engine.WriteAsync(batch, cancellationToken).ConfigureAwait(false);
+                    batch.Clear();
+                }
+            }
+
+            if (batch.Count > 0)
+            {
+                await _engine.WriteAsync(batch, cancellationToken).ConfigureAwait(false);
+            }
+        }
     }
 
     /// <inheritdoc />

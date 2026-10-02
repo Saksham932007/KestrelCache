@@ -1522,6 +1522,789 @@
           "refId": "C"
         }
       ]
+    },
+    {
+      "id": 23,
+      "type": "row",
+      "title": "Replication (Raft)",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 47
+      },
+      "panels": []
+    },
+    {
+      "id": 24,
+      "type": "stat",
+      "title": "Role",
+      "description": "1 for the leader, 0 for a follower. Exactly one series should sit at 1: two at once would mean two leaders, which is the failure the whole protocol exists to prevent.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "kestrelcache-prometheus"
+      },
+      "gridPos": {
+        "h": 5,
+        "w": 4,
+        "x": 0,
+        "y": 48
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "color": {
+            "mode": "thresholds",
+            "fixedColor": "text"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "blue",
+                "value": null
+              },
+              {
+                "color": "green",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "kestrelcache-prometheus"
+          },
+          "editorMode": "code",
+          "expr": "kestrelcache_raft_is_leader",
+          "legendFormat": "{{node}}",
+          "range": true,
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 25,
+      "type": "stat",
+      "title": "Term",
+      "description": "Increments on every election. A term climbing steadily with no node failures means something is repeatedly disrupting elections -- a flapping network, or a node that thinks it is a voter and is not.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "kestrelcache-prometheus"
+      },
+      "gridPos": {
+        "h": 5,
+        "w": 4,
+        "x": 4,
+        "y": 48
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "text"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "kestrelcache-prometheus"
+          },
+          "editorMode": "code",
+          "expr": "max(kestrelcache_raft_term)",
+          "legendFormat": "term",
+          "range": true,
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 26,
+      "type": "stat",
+      "title": "Voters",
+      "description": "Servers in the current configuration.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "kestrelcache-prometheus"
+      },
+      "gridPos": {
+        "h": 5,
+        "w": 4,
+        "x": 8,
+        "y": 48
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "text"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "kestrelcache-prometheus"
+          },
+          "editorMode": "code",
+          "expr": "max(kestrelcache_raft_voters)",
+          "legendFormat": "voters",
+          "range": true,
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 27,
+      "type": "stat",
+      "title": "Membership change",
+      "description": "1 while a change is in its joint phase, needing a majority of both the old and new configurations. Lingering at 1 is a problem: the cluster then tolerates fewer failures than either configuration alone.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "kestrelcache-prometheus"
+      },
+      "gridPos": {
+        "h": 5,
+        "w": 4,
+        "x": 12,
+        "y": 48
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "color": {
+            "mode": "thresholds",
+            "fixedColor": "text"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "kestrelcache-prometheus"
+          },
+          "editorMode": "code",
+          "expr": "max(kestrelcache_raft_membership_change_in_progress)",
+          "legendFormat": "joint",
+          "range": true,
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 28,
+      "type": "stat",
+      "title": "Snapshot size",
+      "description": "Size of the state-machine image the log is truncated behind.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "kestrelcache-prometheus"
+      },
+      "gridPos": {
+        "h": 5,
+        "w": 4,
+        "x": 16,
+        "y": 48
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "decimals": null,
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "text"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "kestrelcache-prometheus"
+          },
+          "editorMode": "code",
+          "expr": "max(kestrelcache_raft_snapshot_bytes)",
+          "legendFormat": "bytes",
+          "range": true,
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 29,
+      "type": "stat",
+      "title": "Log entries",
+      "description": "Entries the log holds after snapshotting -- what a restart actually has to replay, as opposed to the total it has ever written.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "kestrelcache-prometheus"
+      },
+      "gridPos": {
+        "h": 5,
+        "w": 4,
+        "x": 20,
+        "y": 48
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "text"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "kestrelcache-prometheus"
+          },
+          "editorMode": "code",
+          "expr": "max(kestrelcache_raft_log_entries)",
+          "legendFormat": "entries",
+          "range": true,
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 30,
+      "type": "timeseries",
+      "title": "Replication progress",
+      "description": "Committed, applied and log end per node. A node whose applied index trails the others is the one at risk of falling far enough behind to need a whole snapshot rather than ordinary catch-up.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "kestrelcache-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 53
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "lineWidth": 2,
+            "fillOpacity": 0,
+            "showPoints": "never",
+            "spanNulls": true,
+            "axisSoftMin": 0,
+            "scaleDistribution": {
+              "type": "linear"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "kestrelcache-prometheus"
+          },
+          "editorMode": "code",
+          "expr": "kestrelcache_raft_commit_index",
+          "legendFormat": "{{node}} committed",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "kestrelcache-prometheus"
+          },
+          "editorMode": "code",
+          "expr": "kestrelcache_raft_last_applied",
+          "legendFormat": "{{node}} applied",
+          "range": true,
+          "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "kestrelcache-prometheus"
+          },
+          "editorMode": "code",
+          "expr": "kestrelcache_raft_log_last_index",
+          "legendFormat": "{{node}} log end",
+          "range": true,
+          "refId": "C"
+        }
+      ]
+    },
+    {
+      "id": 31,
+      "type": "timeseries",
+      "title": "Log range and snapshots",
+      "description": "A first index above 1 means the prefix has been folded into a snapshot. The gap between first and last index is the log that still exists; everything before it is covered by the snapshot.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "kestrelcache-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 53
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "lineWidth": 2,
+            "fillOpacity": 0,
+            "showPoints": "never",
+            "spanNulls": true,
+            "axisSoftMin": 0,
+            "scaleDistribution": {
+              "type": "linear"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "kestrelcache-prometheus"
+          },
+          "editorMode": "code",
+          "expr": "kestrelcache_raft_log_first_index",
+          "legendFormat": "{{node}} first index",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "kestrelcache-prometheus"
+          },
+          "editorMode": "code",
+          "expr": "kestrelcache_raft_snapshot_index",
+          "legendFormat": "{{node}} snapshot index",
+          "range": true,
+          "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "kestrelcache-prometheus"
+          },
+          "editorMode": "code",
+          "expr": "kestrelcache_raft_log_entries",
+          "legendFormat": "{{node}} entries held",
+          "range": true,
+          "refId": "C"
+        }
+      ]
+    },
+    {
+      "id": 32,
+      "type": "timeseries",
+      "title": "Elections and membership",
+      "description": "Elections started but not won are the interesting line: a node campaigning repeatedly and losing is disrupting a healthy cluster without being able to replace it.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "kestrelcache-prometheus"
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 0,
+        "y": 61
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": true,
+            "axisSoftMin": 0,
+            "scaleDistribution": {
+              "type": "linear"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "kestrelcache-prometheus"
+          },
+          "editorMode": "code",
+          "expr": "increase(kestrelcache_raft_elections_started_total[$__rate_interval])",
+          "legendFormat": "{{node}} started",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "kestrelcache-prometheus"
+          },
+          "editorMode": "code",
+          "expr": "increase(kestrelcache_raft_elections_won_total[$__rate_interval])",
+          "legendFormat": "{{node}} won",
+          "range": true,
+          "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "kestrelcache-prometheus"
+          },
+          "editorMode": "code",
+          "expr": "increase(kestrelcache_raft_membership_changes_total[$__rate_interval])",
+          "legendFormat": "{{node}} membership changes",
+          "range": true,
+          "refId": "C"
+        }
+      ]
+    },
+    {
+      "id": 33,
+      "type": "timeseries",
+      "title": "Snapshot activity",
+      "description": "An installed snapshot means a follower was too far behind to catch up from the log, so it was sent the whole dataset. Frequent installs suggest the snapshot threshold is too eager for the replication lag.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "kestrelcache-prometheus"
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 12,
+        "y": 61
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "lineWidth": 2,
+            "fillOpacity": 0,
+            "showPoints": "never",
+            "spanNulls": true,
+            "axisSoftMin": 0,
+            "scaleDistribution": {
+              "type": "linear"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "kestrelcache-prometheus"
+          },
+          "editorMode": "code",
+          "expr": "increase(kestrelcache_raft_snapshots_taken_total[$__rate_interval])",
+          "legendFormat": "{{node}} taken",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "kestrelcache-prometheus"
+          },
+          "editorMode": "code",
+          "expr": "increase(kestrelcache_raft_snapshots_installed_total[$__rate_interval])",
+          "legendFormat": "{{node}} installed",
+          "range": true,
+          "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "kestrelcache-prometheus"
+          },
+          "editorMode": "code",
+          "expr": "rate(kestrelcache_raft_snapshot_chunks_sent_total[$__rate_interval])",
+          "legendFormat": "{{node}} chunks sent/sec",
+          "range": true,
+          "refId": "C"
+        }
+      ]
     }
   ],
   "preload": true,
@@ -1545,5 +2328,5 @@
   "uid": "kestrelcache-overview",
   "version": 1,
   "weekStart": "",
-  "description": "Server throughput and tail latency on top, storage-engine internals below: level shape, compaction volume, Bloom filter effectiveness and cache behaviour. The engine panels are the ones that explain the latency panels."
+  "description": "Server throughput and tail latency on top, storage-engine internals in the middle, and replication at the bottom. The engine panels explain the latency panels; the Raft panels explain which node is answering at all."
 }

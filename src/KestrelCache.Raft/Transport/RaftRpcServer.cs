@@ -163,6 +163,14 @@ public sealed class RaftRpcServer(string bindAddress, int port) : IAsyncDisposab
                 return RaftWire.Encode(response);
             }
 
+            case RaftMessageKind.InstallSnapshotRequest:
+            {
+                var request = RaftWire.DecodeInstallSnapshotRequest(reader, null);
+                var response = await Node.HandleInstallSnapshotAsync(request, cancellationToken)
+                    .ConfigureAwait(false);
+                return RaftWire.Encode(response);
+            }
+
             default:
                 throw new CorruptRecordException(
                     $"A peer sent a response frame ({kind}) where a request was expected.", 0);

@@ -44,6 +44,18 @@ public sealed record ServerOptions
     /// <summary>Port this node listens on for peer traffic.</summary>
     public int RaftPort { get; init; } = 7380;
 
+    /// <summary>
+    /// Start as a server joining an existing cluster rather than bootstrapping a new one.
+    /// </summary>
+    /// <remarks>
+    /// <c>--raft-peers</c> serves two purposes that have to be separated for a joining server:
+    /// it says who the voters are, and it says how to reach them. A joining server needs the
+    /// addresses — it will have to replicate and vote once it is admitted — but must start with
+    /// <i>no</i> voters, because a server that counts itself a voter can elect itself the moment
+    /// its election timer fires, before it has ever heard from the cluster it is joining.
+    /// </remarks>
+    public bool RaftJoin { get; init; }
+
     /// <summary>How long a follower waits without hearing from a leader before standing for election.</summary>
     public TimeSpan RaftElectionTimeout { get; init; } = TimeSpan.FromMilliseconds(600);
 
@@ -52,6 +64,13 @@ public sealed record ServerOptions
 
     /// <summary>True when this server is configured to replicate.</summary>
     public bool IsClustered => !string.IsNullOrWhiteSpace(RaftNodeId) && RaftPeers.Count > 0;
+
+    /// <summary>
+    /// The voters this node bootstraps with: everyone for a founding member, nobody for a
+    /// joining one.
+    /// </summary>
+    public IReadOnlyList<string> BootstrapVoters =>
+        RaftJoin ? [] : [.. RaftPeers.Select(peer => peer.Split('=')[0])];
 
     /// <summary>Builds the engine options this server will open its database with.</summary>
     public DatabaseOptions ToDatabaseOptions() => new()

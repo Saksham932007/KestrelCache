@@ -97,7 +97,10 @@ internal sealed class ServerMetrics
     /// <summary>
     /// Renders every metric in Prometheus exposition format, engine counters included.
     /// </summary>
-    internal string Render(EngineStats engine, ServerOptions options)
+    internal string Render(
+        EngineStats engine,
+        ServerOptions options,
+        KestrelCache.Raft.RaftStats? raft = null)
     {
         var text = new StringBuilder(4096);
 
@@ -209,6 +212,65 @@ internal sealed class ServerMetrics
         Gauge("kestrelcache_dotnet_gc_collections_gen2", "Gen-2 collections.", GC.CollectionCount(2));
         Gauge("kestrelcache_dotnet_threadpool_threads", "Thread-pool threads.", ThreadPool.ThreadCount);
         Gauge("kestrelcache_dotnet_threadpool_queue_length", "Queued thread-pool work items.", ThreadPool.PendingWorkItemCount);
+
+        // ---- consensus
+        if (raft is not null)
+        {
+            Gauge("kestrelcache_raft_enabled", "1 when this node is part of a Raft cluster.", 1);
+            Gauge(
+                "kestrelcache_raft_is_leader",
+                "1 when this node currently accepts writes.",
+                raft.Role == KestrelCache.Raft.RaftRole.Leader ? 1 : 0);
+            Gauge("kestrelcache_raft_term", "The term this node believes it is in.", raft.Term);
+            Gauge("kestrelcache_raft_commit_index", "Highest committed log index.", raft.CommitIndex);
+            Gauge("kestrelcache_raft_last_applied", "Highest index applied to the state machine.", raft.LastApplied);
+            Gauge("kestrelcache_raft_log_last_index", "Index of the last log entry.", raft.LastLogIndex);
+
+            // The log's live range is what makes snapshotting visible. A first index above 1
+            // means the prefix has been folded into a snapshot, and the gap between first and
+            // last is what a restart actually has to replay.
+            Gauge("kestrelcache_raft_log_first_index", "Lowest index still held as a log entry.", raft.FirstLogIndex);
+            Gauge("kestrelcache_raft_log_entries", "Entries the log holds.", raft.LogEntryCount);
+            Gauge("kestrelcache_raft_log_bytes", "Bytes the Raft log occupies.", raft.LogSizeBytes);
+            Gauge("kestrelcache_raft_snapshot_index", "Last index covered by the snapshot.", raft.SnapshotIndex);
+            Gauge("kestrelcache_raft_snapshot_bytes", "Size of the snapshot file.", raft.SnapshotSizeBytes);
+            Counter("kestrelcache_raft_snapshots_taken_total", "Snapshots this node has taken.", raft.SnapshotsTaken);
+            Counter("kestrelcache_raft_snapshots_installed_total", "Snapshots received from a leader.", raft.SnapshotsInstalled);
+            Counter("kestrelcache_raft_snapshot_chunks_sent_total", "Snapshot chunks sent as leader.", raft.SnapshotChunksSent);
+            Counter("kestrelcache_raft_elections_started_total", "Elections this node has started.", raft.ElectionsStarted);
+            Counter("kestrelcache_raft_elections_won_total", "Elections this node has won.", raft.ElectionsWon);
+            Counter("kestrelcache_raft_membership_changes_total", "Membership changes completed.", raft.MembershipChanges);
+
+            if (raft.Configuration is { } configuration)
+            {
+                Gauge("kestrelcache_raft_voters", "Voters in the current configuration.", configuration.Voters.Count);
+
+                // Worth alerting on: a change that never leaves the joint phase means the cluster
+                // permanently needs two majorities, so it tolerates fewer failures than either
+                // configuration alone.
+                Gauge(
+                    "kestrelcache_raft_membership_change_in_progress",
+                    "1 while a membership change is in its joint phase.",
+                    configuration.IsJoint ? 1 : 0);
+            }
+
+            // Replication lag per follower is the clearest sign of a node falling behind far
+            // enough to need a state transfer rather than ordinary catch-up.
+            if (raft.MatchIndex.Count > 0)
+            {
+                text.Append("# HELP kestrelcache_raft_peer_match_index Highest index each peer has acknowledged.\n");
+                text.Append("# TYPE kestrelcache_raft_peer_match_index gauge\n");
+                foreach (var (peer, matchIndex) in raft.MatchIndex.OrderBy(p => p.Key))
+                {
+                    text.Append("kestrelcache_raft_peer_match_index{peer=\"")
+                        .Append(peer).Append("\"} ").Append(matchIndex).Append('\n');
+                }
+            }
+        }
+        else
+        {
+            Gauge("kestrelcache_raft_enabled", "1 when this node is part of a Raft cluster.", 0);
+        }
 
         Counter(
             "kestrelcache_build_info",

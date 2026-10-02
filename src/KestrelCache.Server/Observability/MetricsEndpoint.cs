@@ -115,7 +115,7 @@ internal sealed class MetricsEndpoint(
                 return (
                     "200 OK",
                     "text/plain; version=0.0.4; charset=utf-8",
-                    metrics.Render(database.GetStats(), options));
+                    metrics.Render(database.GetStats(), options, RaftStatsOrNull()));
 
             case "/health" or "/healthz":
                 // A liveness probe must not merely report that the process is running -- it has
@@ -159,6 +159,25 @@ internal sealed class MetricsEndpoint(
                     text.Append("block cache hits  ").Append(stats.BlockCacheHitRate.ToString("P1"))
                         .Append('\n');
                 }
+
+                if (RaftStatsOrNull() is { } raft)
+                {
+                    text.Append('\n');
+                    text.Append("raft role         ").Append(raft.Role).Append('\n');
+                    text.Append("raft term         ").Append(raft.Term).Append('\n');
+                    text.Append("raft leader       ").Append(raft.LeaderId ?? "none").Append('\n');
+                    text.Append("raft voters       ")
+                        .Append(raft.Configuration?.ToString() ?? "?").Append('\n');
+                    text.Append("raft log          [").Append(raft.FirstLogIndex).Append("..")
+                        .Append(raft.LastLogIndex).Append("]\n");
+                    text.Append("raft committed    ").Append(raft.CommitIndex).Append('\n');
+                    text.Append("raft snapshot     ")
+                        .Append(raft.SnapshotIndex > 0
+                            ? $"index {raft.SnapshotIndex}, {raft.SnapshotSizeBytes} bytes"
+                            : "none")
+                        .Append('\n');
+                }
+
                 return ("200 OK", "text/plain; charset=utf-8", text.ToString());
             }
 
@@ -171,6 +190,12 @@ internal sealed class MetricsEndpoint(
                 return ("404 Not Found", "text/plain; charset=utf-8", "not found\n");
         }
     }
+
+    /// <summary>Consensus counters when this node is clustered, else null.</summary>
+    private KestrelCache.Raft.RaftStats? RaftStatsOrNull() =>
+        database.Engine is KestrelCache.Raft.ReplicatedEngine replicated
+            ? replicated.GetRaftStats()
+            : null;
 
     private static async Task WriteResponseAsync(
         Stream stream,

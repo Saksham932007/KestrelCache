@@ -25,6 +25,8 @@ if (args.Length > 0 && args[0] is "-h" or "--help" or "help")
           --raft-id ID      This node's id; enables replication
           --raft-peers LIST Comma-separated id=host:port for every node, this one included
           --raft-port N     Port for peer traffic (default 7380)
+          --raft-join       Join an existing cluster instead of bootstrapping a new one:
+                            use --raft-peers for addresses only, and start with no voters
           --raft-trace      Log every role transition and election decision
 
         A THREE-NODE CLUSTER
@@ -38,6 +40,14 @@ if (args.Length > 0 && args[0] is "-h" or "--help" or "help")
             redis-cli -p 6381 cluster info
             redis-cli -p 6381 set replicated yes      # -NOTLEADER names the leader if not here
             redis-cli -p 6382 get replicated          # followers serve reads
+
+          Grow, shrink and compact it while it runs:
+
+            kestrel-server --raft-id n4 --raft-join --raft-port 7384 --port 6384 --data ./d4 \
+              --raft-peers n1=127.0.0.1:7381,n2=127.0.0.1:7382,n3=127.0.0.1:7383
+            redis-cli -p 6381 cluster addnode n4 127.0.0.1:7384
+            redis-cli -p 6381 cluster snapshot        # truncate the log behind a snapshot
+            redis-cli -p 6381 cluster removenode n4
 
         TRY IT
           redis-cli -p 6380 set hello world
@@ -75,8 +85,11 @@ if (options.IsClustered)
     cluster = await ClusterHost.StartAsync(options, localEngine, trace);
     database = KestrelDb.Wrap(cluster.Engine);
 
-    Console.WriteLine($"  cluster       {options.RaftNodeId} of "
-        + $"[{string.Join(", ", options.RaftPeers)}]");
+    Console.WriteLine(
+        $"  cluster       {options.RaftNodeId}"
+            + (options.RaftJoin
+                ? " (joining; membership comes from the leader)"
+                : $" of [{string.Join(", ", options.RaftPeers)}]"));
     Console.WriteLine($"  raft          0.0.0.0:{cluster.RaftPort}");
 }
 else
@@ -217,6 +230,7 @@ static ServerOptions ParseOptions(string[] argv)
                     | StringSplitOptions.TrimEntries),
             },
             "raft-port" when value is not null => options with { RaftPort = int.Parse(value) },
+            "raft-join" => options with { RaftJoin = true },
             "raft-election-timeout" when value is not null => options with
             {
                 RaftElectionTimeout = TimeSpan.FromMilliseconds(int.Parse(value)),

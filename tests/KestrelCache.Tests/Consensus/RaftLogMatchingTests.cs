@@ -30,6 +30,7 @@ namespace KestrelCache.Tests;
 /// Each one reported success for a write that did not happen, which is the worst failure a
 /// database can have, and none was visible without comparing the logs entry by entry.
 /// </remarks>
+[Collection("raft-cluster")]
 public sealed class RaftLogMatchingTests(ITestOutputHelper output)
 {
     [Theory]

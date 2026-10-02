@@ -6,6 +6,19 @@ behind it, the trade-offs each one makes, what was measured, and what I would do
 Where a number appears it was measured on the machine described under
 [Measurement conditions](#measurement-conditions), not estimated.
 
+Replication has its own document: **[REPLICATION.md](REPLICATION.md)** covers Raft, log
+snapshotting and membership changes.
+
+**Contents**
+
+1. [The problem, and why there are two engines](#1-the-problem-and-why-there-are-two-engines)
+2. [Durability: what "durable" actually means](#2-durability-what-durable-actually-means)
+3. [Concurrency](#3-concurrency)
+4. [The LSM engine in detail](#4-the-lsm-engine-in-detail)
+5. [The server](#5-the-server)
+6. [Testing strategy](#6-testing-strategy)
+7. [What I would do differently](#7-what-i-would-do-differently)
+
 ---
 
 ## 1. The problem, and why there are two engines
@@ -407,82 +420,7 @@ numerator is worse than reporting none.
 
 ---
 
-## 6. Replication
-
-A Raft implementation, with an adapter that presents a replicated cluster as an ordinary
-`IStorageEngine`. That seam is what lets the entire server above it be unchanged — the same RESP
-layer, command table and metrics endpoint serve a three-node cluster, so replication is a
-deployment choice rather than a second codebase.
-
-### The three rules that carry the safety argument
-
-1. **One leader per term.** A node votes at most once per term and persists that vote *before*
-   replying, so two candidates cannot both collect a majority in the same term. This is why the
-   persistent state fsyncs: a node that forgot its vote could grant a second after restarting, and
-   two leaders accepting conflicting writes is the failure Raft exists to prevent.
-2. **Only an up-to-date candidate can win.** A voter refuses any candidate whose log is behind its
-   own. With the majority requirement, this guarantees the winner already holds every committed
-   entry — so a new leader never has to recover entries from followers.
-3. **A leader never overwrites its own log.** It only appends, and brings followers into line by
-   finding the last index where they agree and replacing their divergent suffix. Divergence is
-   always resolved in the leader's favour.
-
-### Why the no-op entry exists
-
-A new leader may hold entries from previous terms that are replicated on a majority but not
-committed, and Raft forbids committing them by counting replicas — there is an interleaving in
-which such an entry is subsequently overwritten, so counting it as committed can lose data a client
-was told was durable (figure 8 of the Raft paper). The fix is for the leader to append one entry of
-its own term and commit that; committing an entry implicitly commits everything before it, so the
-stale prefix becomes committed safely as a side effect.
-
-### Testing consensus
-
-The transport is behind an interface, and that is what makes any of this testable. Raft's
-interesting behaviour is entirely about coping with a network that loses, delays, reorders and
-partitions messages, and none of that is reproducible over a loopback socket — a test cannot sever
-a connection at a precise instant, or drop exactly the reply that would have completed an election.
-With an in-process network the test controls, a split-brain scenario is three lines and runs in
-milliseconds, deterministically. A separate suite runs a cluster over real sockets so the wire
-format is exercised too, including a 512 KiB value that must be reassembled from several reads.
-
-### Three safety bugs one test found
-
-All three produced a cluster that looked perfectly healthy from outside — one leader, matching
-commit indices, writes returning success — while the logs underneath had quietly diverged. All three
-reported success for a write that did not happen, which is the worst failure a database can have.
-None was visible to any test that checked the cluster from outside; all three were found by one
-test that compares every node's log entry by entry.
-
-1. **Two proposals assigned the same index.** The index was computed as `LastIndex + 1` under the
-   state lock, which was released before the append. Two concurrent proposals both built an entry
-   for the same index; the first was written, the second matched an existing index with an identical
-   term, was taken for a duplicate, and was silently discarded — while its client was told the write
-   had committed, because the waiter was keyed on the index and the *other* entry committed there.
-   The log now assigns indices while holding its own append lock.
-2. **A follower could accept entries beyond the end of its log.** `Matches` returned true for a
-   missing index, because `TermAt` returns 0 for an absent entry and the leader sent 0 for an entry
-   it did not have either. The follower passed the consistency check for a position it did not hold,
-   accepted entries starting there, and opened a gap — after which every index was off by one while
-   still carrying a plausible term. That is the one state Raft's induction argument cannot recover
-   from: two logs agreeing on (index, term) while holding different entries.
-3. **A waiter was keyed on index alone.** A deposed leader's uncommitted entry at index N can be
-   replaced by a different entry at index N from a later term, and applying that entry satisfied the
-   original client. Waiters now carry their term and are failed on a mismatch.
-
-### What replication does not guarantee
-
-Reads go to the local engine, which makes them fast and, on a follower, possibly stale. Making every
-read linearizable needs either a round trip through the log per read, or a quorum confirmation of
-leadership first (ReadIndex) — both trade read latency for a guarantee many callers do not need.
-
-What *is* guaranteed: a read on the leader after a successful write on the leader sees that write,
-because `ProposeAsync` returns only once the entry has been applied locally. Read-your-writes holds
-against the leader; cluster-wide linearizability does not.
-
----
-
-## 7. Testing strategy
+## 6. Testing strategy
 
 250 tests. The ones that earned their place:
 
@@ -509,21 +447,20 @@ cannot satisfy, and the one that would have caught the hash bug directly.
 
 ---
 
-## 8. What I would do differently
+## 7. What I would do differently
 
 Honest gaps, roughly in order of how much they would matter:
 
 - **Linearizable reads.** ReadIndex would close the gap with a quorum round trip per read, without
   putting reads through the log. The current behaviour is correct and documented, but "reads may be
-  stale on a follower" is a real limitation.
-- **Cluster membership changes.** The peer set is fixed at startup. Adding or removing a node needs
-  Raft's joint-consensus protocol, which is a substantial piece of work on its own.
-- **Log compaction and snapshots.** The Raft log grows without bound. Production implementations
-  snapshot the state machine and truncate the log behind it; here a long-running cluster's log grows
-  forever.
-- **The write path's per-operation cost.** Group commit fixed the serialisation; the remaining 6.6x
-  gap to Redis on SET is per-operation overhead. The next step would be profiling rather than
+  stale on a follower" is a real limitation. See
+  [REPLICATION.md](REPLICATION.md#what-replication-does-not-guarantee).
+- **The write path's per-operation cost.** Group commit fixed the serialisation; the remaining
+  6.6x gap to Redis on SET is per-operation overhead. The next step would be profiling rather than
   guessing — my suspicion is memtable allocation and the per-command `WriteBatch`.
+- **A pre-vote phase.** A partitioned node that rejoins can force a term increment and a
+  needless election. The Raft dissertation's pre-vote extension avoids it by having a candidate
+  check it could win before incrementing anything.
 - **A better block cache policy.** LRU is vulnerable to a large scan evicting the working set.
   Compactions here bypass the cache, which sidesteps it, but S3-FIFO or ARC would be more robust.
 - **LZ4 or Zstandard instead of Deflate.** Deflate was chosen because it is in the base class
@@ -533,6 +470,10 @@ Honest gaps, roughly in order of how much they would matter:
 - **A smaller container image.** 205 MB, dominated by the .NET runtime base image. Trimming or
   native AOT would cut it substantially, but AOT conflicts with the reflection-based JSON used for
   the manifest.
+
+Two items that used to head this list — Raft log snapshotting and cluster membership changes —
+are now implemented, and have their own section in
+[REPLICATION.md](REPLICATION.md).
 
 ---
 

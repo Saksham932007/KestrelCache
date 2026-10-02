@@ -1,4 +1,5 @@
 using KestrelCache.Raft;
+using Xunit;
 
 namespace KestrelCache.Tests;
 
@@ -56,15 +57,22 @@ public sealed class RaftCluster : IAsyncDisposable
         IStorageEngine Engine,
         string DataDirectory);
 
+    private EngineKind _engineKind = EngineKind.Lsm;
+    private Func<RaftOptions, RaftOptions>? _configure;
+
     /// <summary>Starts a cluster of <paramref name="size"/> nodes named n1..nN.</summary>
     public static async Task<RaftCluster> StartAsync(
         int size,
         EngineKind engine = EngineKind.Lsm,
-        Action<RaftOptions>? configure = null)
+        Func<RaftOptions, RaftOptions>? configure = null)
     {
         var directory = new TempDirectory($"raft-{size}");
         var network = new InMemoryRaftNetwork();
-        var cluster = new RaftCluster(directory, network);
+        var cluster = new RaftCluster(directory, network)
+        {
+            _engineKind = engine,
+            _configure = configure,
+        };
 
         var ids = Enumerable.Range(1, size).Select(i => $"n{i}").ToArray();
 
@@ -76,11 +84,23 @@ public sealed class RaftCluster : IAsyncDisposable
         return cluster;
     }
 
+    /// <summary>
+    /// Brings up a server that is not yet a cluster member, with no bootstrap configuration.
+    /// </summary>
+    /// <remarks>
+    /// An empty peer list is how Raft models a joining server: it cannot campaign, because it has
+    /// no voters to count a majority against, and it waits to learn the membership from whichever
+    /// leader starts replicating to it. Starting it with the current membership instead would let
+    /// it elect itself the moment it timed out.
+    /// </remarks>
+    public Task AddJoiningNodeAsync(string id) =>
+        AddMemberAsync(id, [], _engineKind, _configure);
+
     private async Task AddMemberAsync(
         string id,
         IReadOnlyList<string> allIds,
         EngineKind engineKind,
-        Action<RaftOptions>? configure)
+        Func<RaftOptions, RaftOptions>? configure)
     {
         string nodeDirectory = _directory.File(id);
         Directory.CreateDirectory(nodeDirectory);
@@ -102,7 +122,9 @@ public sealed class RaftCluster : IAsyncDisposable
             Trace = Record,
         };
 
-        configure?.Invoke(options);
+        // RaftOptions is a record with init-only properties, so a test tweaks it by returning a
+        // modified copy rather than mutating the original.
+        if (configure is not null) options = configure(options);
 
         var store = new ReplicatedStore(engine);
         var node = new RaftNode(options, transport: Network.TransportFor(id), stateMachine: store);
@@ -220,6 +242,26 @@ public sealed class RaftCluster : IAsyncDisposable
         Network.Isolate(nodeId);
     }
 
+    /// <summary>Ticks until every live node agrees on the configuration, then returns it.</summary>
+    public async Task<RaftConfiguration?> WaitForConfigurationAsync(
+        IReadOnlyList<string> expectedVoters,
+        int maxTicks = 800)
+    {
+        var expected = expectedVoters.ToHashSet();
+
+        await TickUntilAsync(
+            () => _members.Values.All(m =>
+            {
+                var configuration = m.Node.Configuration;
+                return !configuration.IsJoint
+                    && configuration.Voters.Count == expected.Count
+                    && configuration.Voters.All(expected.Contains);
+            }),
+            maxTicks);
+
+        return _members.Values.FirstOrDefault()?.Node.Configuration;
+    }
+
     /// <summary>
     /// Brings a stopped node back, reopening its log and state from disk.
     /// </summary>
@@ -230,7 +272,7 @@ public sealed class RaftCluster : IAsyncDisposable
     public async Task RestartAsync(string nodeId, IReadOnlyList<string> allIds)
     {
         Network.Heal(nodeId);
-        await AddMemberAsync(nodeId, allIds, EngineKind.Lsm, configure: null);
+        await AddMemberAsync(nodeId, allIds, _engineKind, _configure);
     }
 
     /// <summary>A readable dump of every node's state, for assertion messages.</summary>
@@ -239,9 +281,13 @@ public sealed class RaftCluster : IAsyncDisposable
         _members.Values.Select(m =>
         {
             var stats = m.Node.GetStats();
+            string snapshot = stats.SnapshotIndex > 0
+                ? $" snap={stats.SnapshotIndex}@{stats.SnapshotTerm}"
+                : string.Empty;
             return $"  {m.NodeId}: {stats.Role,-9} term={stats.Term} "
-                + $"log={stats.LastLogIndex} commit={stats.CommitIndex} "
-                + $"applied={stats.LastApplied} leader={stats.LeaderId ?? "?"}";
+                + $"log=[{stats.FirstLogIndex}..{stats.LastLogIndex}]{snapshot} "
+                + $"commit={stats.CommitIndex} applied={stats.LastApplied} "
+                + $"leader={stats.LeaderId ?? "?"} cfg={stats.Configuration}";
         }));
 
     /// <inheritdoc />
@@ -256,3 +302,16 @@ public sealed class RaftCluster : IAsyncDisposable
         _directory.Dispose();
     }
 }
+
+/// <summary>
+/// Cluster tests run one at a time.
+/// </summary>
+/// <remarks>
+/// They drive consensus against wall-clock election timeouts, so starving them of CPU makes a
+/// healthy leader look like a failed one and a tick budget run out for reasons that have nothing
+/// to do with the code. On a four-thread machine, running them alongside the rest of the suite
+/// produced failures that disappeared in isolation -- which is the worst kind of test, because it
+/// trains you to ignore it.
+/// </remarks>
+[CollectionDefinition("raft-cluster", DisableParallelization = true)]
+public sealed class RaftClusterCollection;

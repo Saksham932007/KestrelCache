@@ -5,6 +5,27 @@ using System.Net.Sockets;
 
 namespace KestrelCache.Raft;
 
+/// <summary>
+/// Lets peer addresses be added and removed at runtime.
+/// </summary>
+/// <remarks>
+/// Membership becomes a runtime property once joint consensus exists: the voter set lives in the
+/// replicated log rather than in configuration, so a node must be able to learn how to reach a
+/// server it was never started with. Abstracted away from the concrete transport so the command
+/// layer does not have to know whether it is talking over TCP or an in-process network.
+/// </remarks>
+public interface IRaftPeerDirectory
+{
+    /// <summary>Registers, or updates, how to reach a peer.</summary>
+    void AddPeer(RaftPeerAddress address);
+
+    /// <summary>Forgets a peer that has left the cluster.</summary>
+    void RemovePeer(string nodeId);
+
+    /// <summary>Peers this directory knows how to reach.</summary>
+    IReadOnlyCollection<RaftPeerAddress> Peers { get; }
+}
+
 /// <summary>Where a peer can be reached.</summary>
 /// <param name="NodeId">The peer's stable identifier.</param>
 /// <param name="Host">Hostname or address.</param>
@@ -58,18 +79,48 @@ public readonly record struct RaftPeerAddress(string NodeId, string Host, int Po
 /// an error; the connection is dropped so the next attempt reconnects.
 /// </para>
 /// </remarks>
-public sealed class TcpRaftTransport : IRaftTransport, IAsyncDisposable
+public sealed class TcpRaftTransport : IRaftTransport, IRaftPeerDirectory, IAsyncDisposable
 {
-    private readonly Dictionary<string, RaftPeerAddress> _addresses;
+    private readonly ConcurrentDictionary<string, RaftPeerAddress> _addresses;
     private readonly ConcurrentDictionary<string, PeerConnection> _connections = new();
     private readonly TimeSpan _connectTimeout;
 
     /// <summary>Creates a transport that can reach the given peers.</summary>
     public TcpRaftTransport(IEnumerable<RaftPeerAddress> peers, TimeSpan? connectTimeout = null)
     {
-        _addresses = peers.ToDictionary(peer => peer.NodeId);
+        _addresses = new ConcurrentDictionary<string, RaftPeerAddress>(
+            peers.Select(peer => KeyValuePair.Create(peer.NodeId, peer)));
         _connectTimeout = connectTimeout ?? TimeSpan.FromMilliseconds(500);
     }
+
+    /// <summary>
+    /// Registers a peer that was not in the initial set, so a server added to the cluster can
+    /// be reached.
+    /// </summary>
+    /// <remarks>
+    /// Membership is a runtime property once joint consensus exists: the voter set lives in the
+    /// replicated log, not in configuration, so the transport has to be able to learn about an
+    /// address it was never started with. Returning quietly on a duplicate keeps the call
+    /// idempotent, which matters because a configuration entry can be adopted more than once
+    /// across a restart.
+    /// </remarks>
+    /// <inheritdoc />
+    public void AddPeer(RaftPeerAddress address) =>
+        _addresses.AddOrUpdate(address.NodeId, address, (_, _) => address);
+
+    /// <inheritdoc />
+    public void RemovePeer(string nodeId)
+    {
+        _addresses.TryRemove(nodeId, out _);
+
+        if (_connections.TryRemove(nodeId, out var connection))
+        {
+            connection.Dispose();
+        }
+    }
+
+    /// <inheritdoc />
+    public IReadOnlyCollection<RaftPeerAddress> Peers => [.. _addresses.Values];
 
     /// <inheritdoc />
     public async Task<RequestVoteResponse?> RequestVoteAsync(
@@ -101,6 +152,22 @@ public sealed class TcpRaftTransport : IRaftTransport, IAsyncDisposable
         if (kind != RaftMessageKind.AppendEntriesResponse) return null;
 
         return RaftWire.DecodeAppendEntriesResponse(reader);
+    }
+
+    /// <inheritdoc />
+    public async Task<InstallSnapshotResponse?> InstallSnapshotAsync(
+        string peerId,
+        InstallSnapshotRequest request,
+        CancellationToken cancellationToken)
+    {
+        byte[]? reply = await ExchangeAsync(peerId, RaftWire.Encode(request), cancellationToken)
+            .ConfigureAwait(false);
+        if (reply is null) return null;
+
+        var (kind, reader) = RaftWire.Unframe(reply, peerId);
+        if (kind != RaftMessageKind.InstallSnapshotResponse) return null;
+
+        return RaftWire.DecodeInstallSnapshotResponse(reader);
     }
 
     private async Task<byte[]?> ExchangeAsync(

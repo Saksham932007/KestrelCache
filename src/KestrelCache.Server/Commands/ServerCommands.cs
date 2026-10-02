@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.Text;
+using KestrelCache.Raft;
 using KestrelCache.Server.Resp;
 
 namespace KestrelCache.Server.Commands;
@@ -528,7 +529,7 @@ internal static class ServerCommands
     /// already know them — but the fields describe Raft, not Redis Cluster's hash slots, and
     /// saying so plainly is better than inventing a resemblance that does not hold.
     /// </remarks>
-    internal static ValueTask ClusterAsync(CommandContext context)
+    internal static async ValueTask ClusterAsync(CommandContext context)
     {
         if (context.Database.Engine is not Raft.ReplicatedEngine replicated)
         {
@@ -537,13 +538,13 @@ internal static class ServerCommands
                 RespWriter.WriteBulkString(
                     context.Output,
                     "cluster_enabled:0\r\ncluster_state:ok\r\ncluster_known_nodes:1\r\n");
-                return ValueTask.CompletedTask;
+                return;
             }
 
             RespWriter.WriteError(
                 context.Output,
                 "ERR This instance is not replicated; start it with --raft-id and --raft-peers");
-            return ValueTask.CompletedTask;
+            return;
         }
 
         var stats = replicated.GetRaftStats();
@@ -566,6 +567,34 @@ internal static class ServerCommands
                 text.Append("log_bytes:").Append(stats.LogSizeBytes).Append("\r\n");
                 text.Append("elections_started:").Append(stats.ElectionsStarted).Append("\r\n");
                 text.Append("elections_won:").Append(stats.ElectionsWon).Append("\r\n");
+
+                // The log's live range, not just its end. A first index above 1 means the prefix
+                // has been folded into a snapshot, which is the single most useful thing to know
+                // when wondering why a restart was fast or why a follower needed a state
+                // transfer.
+                text.Append("log_first_index:").Append(stats.FirstLogIndex).Append("\r\n");
+                text.Append("log_entries:").Append(stats.LogEntryCount).Append("\r\n");
+                text.Append("snapshot_index:").Append(stats.SnapshotIndex).Append("\r\n");
+                text.Append("snapshot_term:").Append(stats.SnapshotTerm).Append("\r\n");
+                text.Append("snapshot_bytes:").Append(stats.SnapshotSizeBytes).Append("\r\n");
+                text.Append("snapshots_taken:").Append(stats.SnapshotsTaken).Append("\r\n");
+                text.Append("snapshots_installed:").Append(stats.SnapshotsInstalled).Append("\r\n");
+                text.Append("membership_changes:").Append(stats.MembershipChanges).Append("\r\n");
+
+                var configuration = stats.Configuration;
+                if (configuration is not null)
+                {
+                    text.Append("voters:").Append(string.Join(',', configuration.Voters))
+                        .Append("\r\n");
+                    text.Append("membership_change_in_progress:")
+                        .Append(configuration.IsJoint ? 1 : 0).Append("\r\n");
+                    if (configuration.OutgoingVoters is not null)
+                    {
+                        text.Append("outgoing_voters:")
+                            .Append(string.Join(',', configuration.OutgoingVoters)).Append("\r\n");
+                    }
+                }
+
                 RespWriter.WriteBulkString(context.Output, text.ToString());
                 break;
             }
@@ -593,13 +622,102 @@ internal static class ServerCommands
                 RespWriter.WriteBulkString(context.Output, stats.NodeId);
                 break;
 
+            // ---- membership changes
+
+            case "ADDNODE" when context.ArgumentCount >= 3:
+            {
+                // Takes the address as well as the id, because the leader has to be able to reach
+                // a server before making it a voter -- otherwise the joint entry can never commit
+                // and the change wedges.
+                string nodeId = context.Text(2);
+                string endpoint = context.Text(3);
+
+                RaftPeerAddress address;
+                try
+                {
+                    address = RaftPeerAddress.Parse($"{nodeId}={endpoint}");
+                }
+                catch (FormatException exception)
+                {
+                    RespWriter.WriteError(context.Output, $"ERR {exception.Message}");
+                    break;
+                }
+
+                await replicated.AddServerAsync(address, context.CancellationToken)
+                    .ConfigureAwait(false);
+
+                RespWriter.WriteSimpleString(
+                    context.Output,
+                    $"added {nodeId}; voters are now "
+                        + string.Join(",", replicated.Node.Configuration.Voters));
+                break;
+            }
+
+            case "ADDNODE":
+                RespWriter.WriteError(
+                    context.Output, "ERR CLUSTER ADDNODE requires <node-id> <host:port>");
+                break;
+
+            case "REMOVENODE" when context.ArgumentCount >= 2:
+            {
+                string nodeId = context.Text(2);
+
+                await replicated.RemoveServerAsync(nodeId, context.CancellationToken)
+                    .ConfigureAwait(false);
+
+                RespWriter.WriteSimpleString(
+                    context.Output,
+                    $"removed {nodeId}; voters are now "
+                        + string.Join(",", replicated.Node.Configuration.Voters));
+                break;
+            }
+
+            case "REMOVENODE":
+                RespWriter.WriteError(context.Output, "ERR CLUSTER REMOVENODE requires <node-id>");
+                break;
+
+            case "PEERS":
+            {
+                var peers = replicated.KnownPeers.OrderBy(p => p.NodeId).ToList();
+                RespWriter.WriteArrayHeader(context.Output, peers.Count);
+                foreach (var peer in peers)
+                {
+                    RespWriter.WriteBulkString(context.Output, peer.ToString());
+                }
+                break;
+            }
+
+            // ---- snapshots
+
+            case "SNAPSHOT":
+            {
+                var before = replicated.GetRaftStats();
+                var metadata = await replicated.CreateSnapshotAsync(context.CancellationToken)
+                    .ConfigureAwait(false);
+
+                if (metadata is null)
+                {
+                    RespWriter.WriteSimpleString(
+                        context.Output,
+                        "nothing to snapshot: no entries have been applied since the last one");
+                    break;
+                }
+
+                var after = replicated.GetRaftStats();
+                RespWriter.WriteSimpleString(
+                    context.Output,
+                    $"snapshot at index {metadata.Value.LastIncludedIndex}; log "
+                        + $"[{before.FirstLogIndex}..{before.LastLogIndex}] -> "
+                        + $"[{after.FirstLogIndex}..{after.LastLogIndex}], "
+                        + $"{after.SnapshotSizeBytes} byte(s)");
+                break;
+            }
+
             default:
                 RespWriter.WriteError(
                     context.Output, $"ERR Unknown CLUSTER subcommand '{context.Text(1)}'");
                 break;
         }
-
-        return ValueTask.CompletedTask;
     }
 
     /// <summary>Assembly informational version, or a placeholder.</summary>
