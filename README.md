@@ -1,5 +1,9 @@
 # KestrelCache
 
+[![ci](https://github.com/Saksham932007/KestrelCache/actions/workflows/ci.yml/badge.svg)](https://github.com/Saksham932007/KestrelCache/actions/workflows/ci.yml)
+[![.NET 9](https://img.shields.io/badge/.NET-9.0-512BD4)](https://dotnet.microsoft.com/)
+[![license](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+
 A persistent key-value store written from scratch in C#, with two storage engines, a Redis-protocol
 server, and Raft replication.
 
@@ -25,7 +29,8 @@ It speaks the Redis wire protocol, so `redis-cli` and `redis-benchmark` work aga
 | **A server** | RESP over `System.IO.Pipelines`, verified against the genuine `redis-cli` and `redis-benchmark`. |
 | **Replication** | Raft — leader election with pre-vote, log replication, persistent state, log snapshotting, and membership changes through joint consensus. Nodes join as non-voting learners and are promoted once caught up, so growing the cluster never costs it failure tolerance. |
 | **Observability** | Prometheus metrics with a latency histogram and engine internals, a provisioned Grafana dashboard, and fourteen alert rules. |
-| **308 tests** | Including a model-based fuzzer, single-bit-flip corruption sweeps, SIGKILL crash consistency, and a Raft Log Matching verifier run under up to 40% message loss. |
+| **308 tests** | Including a model-based fuzzer, single-bit-flip corruption sweeps, SIGKILL crash consistency, and a Raft Log Matching verifier run under up to 40% message loss. Run on Linux, macOS and Windows, which is how the engine's one genuine portability bug was found. |
+| **CI on three platforms** | Eight jobs: the suite on three platforms, the container image, both compose stacks, and a replicated cluster driven through failover, snapshotting, learner admission and promotion with the real `redis-cli`. |
 
 **The design documents are the interesting part** — why each decision was made, what was measured,
 which bugs the measurements found, and what is still missing:
@@ -151,7 +156,7 @@ src/KestrelCache/              the storage engines
 src/KestrelCache.Raft/         consensus
   Consensus/                     the node, messages, options, recovery
   Log/                           replicated log, persistent state, snapshots
-  Membership/                    configurations and joint consensus
+  Membership/                    configurations, joint consensus, learners
   Transport/                     TCP transport, RPC server, wire format,
                                  and the in-process network the tests drive
 
@@ -165,12 +170,14 @@ src/KestrelCache.Cli/          a CLI, and the crash-test harness
 tests/KestrelCache.Tests/      308 tests
   Engines/                       engine behaviour, fuzzing, corruption, crashes
   Server/                        RESP protocol over a real socket
-  Consensus/                     elections, replication, snapshots, membership
+  Consensus/                     elections, pre-vote, replication, snapshots,
+                                 membership and learners
 
 benchmarks/                    latency percentiles and cross-engine comparison
 deploy/                        compose stacks, Prometheus config, Grafana dashboard
 docs/DESIGN.md                 storage: why, what was measured, what is missing
-docs/REPLICATION.md            consensus: Raft, snapshots, membership changes
+docs/REPLICATION.md            consensus: Raft, snapshots, membership, learners,
+                               pre-vote
 CHANGELOG.md                   what changed, and which bug each change fixed
 ```
 
@@ -282,7 +289,9 @@ await foreach (var (key, value) in db.ScanPrefixAsync("order:"))
 ## Some bugs worth reading about
 
 The measurements and tests here found real bugs, and the ones that were hardest to find are
-described in full in [docs/DESIGN.md](docs/DESIGN.md). Three that stand out:
+described in full in [docs/DESIGN.md](docs/DESIGN.md) and
+[docs/REPLICATION.md](docs/REPLICATION.md). The ones that stand out all share a shape: the system
+looked completely healthy while being wrong.
 
 **A Bloom filter at 14% false positives against a predicted 0.8%.** Unit tests measured 0.74% and
 were right — they used keys with distinct prefixes, while the benchmark used dense integers. Two
@@ -298,7 +307,7 @@ a cluster that looked perfectly healthy from outside — one leader, matching co
 returning `OK` — while the logs underneath had diverged. All three were found by one test that
 compares every node's log entry by entry, and none was visible to any test that checked the cluster
 from outside.
-[Details](docs/DESIGN.md#three-safety-bugs-one-test-found)
+[Details](docs/REPLICATION.md#three-safety-bugs-one-test-found)
 
 **A write path that could not be made faster by pipelining.** Throughput was flat at ~49,000
 writes/s whether fsync was on or off, while reads scaled 4.7x with pipelining. Reads scaling and
@@ -313,6 +322,32 @@ against a cluster it is no longer part of. It cannot win, but it can be endlessl
 leader now keeps replicating to a departed server until it acknowledges the entry that removed it.
 [Details](docs/REPLICATION.md#a-removed-server-has-to-be-told)
 
+**A three-node cluster that had never enabled clustering.** The compose files pass every flag as
+`--name=value`. The argument parser only understood `--name value`, so `--raft-id=n1` matched
+nothing and was silently discarded by the switch's default case — three unrelated single-node
+servers came up looking perfectly healthy, and the documented cluster walkthrough could not have
+worked for anyone who followed it. The single-node stack had the identical bug and passed anyway,
+because every value it passes happens to equal the default, so nothing ever looked wrong. The fix
+worth having is not the `=` parsing but the refusal: an unrecognised flag is now an error, because
+a silently dropped option is indistinguishable from an honoured one right up until something
+downstream behaves inexplicably.
+
+**Compaction that was correct on POSIX by accident of the filesystem.** Installing a compacted
+Bitcask log renamed over the live path while both files were still open — fine on Linux and macOS,
+where the old inode survives for whoever holds a descriptor, and broken on Windows for all 15
+compaction tests. Two apparent fixes were not: `FileShare.Delete` lets Windows delete an open file
+but its directory entry outlives the delete, so the name stays occupied; and `File.Replace`
+performs the right displacement internally while demanding write access the log deliberately does
+not share. Doing the two renames by hand works, with the backups numbered — because a fixed name
+would pass the simple tests and then deadlock the concurrency test, where an old-generation read is
+always in flight. The engine no longer depends on rename-over-open being atomic anywhere.
+[Details](docs/DESIGN.md#which-is-where-this-stopped-being-portable)
+
+**A dashboard whose every Raft legend rendered blank.** The panels and two alert annotations were
+written against a `{{ node }}` label that no consensus metric had ever carried. Nothing errored;
+the graphs simply drew unlabelled series, and the alerts would have fired naming nobody. Found by
+reading a `/metrics` scrape rather than the dashboard.
+
 **A diagnostic that destroyed what it measured.** The test written to find the Raft bugs read each
 node's log by reopening the file — and replay truncates a torn tail, so inspecting a live node's
 log *shortened* it. It reported followers holding two entries out of twenty-six, having caused the
@@ -325,7 +360,9 @@ divergence it was looking for.
 
 Working and tested: both engines, durability policies, compaction, MVCC snapshots, ordered scans,
 the RESP server, Prometheus metrics, and Raft replication with failover, catch-up, log snapshotting,
-pre-vote, learner members and live membership changes.
+pre-vote, learner members and live membership changes. The suite runs on Linux, macOS and Windows,
+and the container, compose and replicated-cluster paths are exercised end to end in CI against the
+genuine `redis-cli`.
 
 Known gaps, stated plainly:
 

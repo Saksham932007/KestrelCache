@@ -108,7 +108,7 @@ Three, and the distinction matters:
 | `NoOp` | nowhere | n/a; it exists only to be committed |
 | `Configuration` | the consensus module | **when appended** |
 
-The last row is the subtle one, and [§4](#4-membership-changes) explains why.
+The last row is the subtle one, and [§4](#4-membership-changes-and-learners) explains why.
 
 ### Verified on a real cluster
 
