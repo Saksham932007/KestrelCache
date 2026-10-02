@@ -1,0 +1,30 @@
+# Build output
+bin/
+obj/
+artifacts/
+[Dd]ebug/
+[Rr]elease/
+*.user
+*.suo
+
+# Test / benchmark output
+BenchmarkDotNet.Artifacts/
+TestResults/
+coverage*.xml
+coverage*.json
+*.trx
+
+# Local database files
+*.db
+*.kc
+*.wal
+*.sst
+data/
+kc-data/
+
+# Editor
+.vs/
+.idea/
+.vscode/
+*.swp
+artifacts/

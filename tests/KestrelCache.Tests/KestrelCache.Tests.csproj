@@ -1,0 +1,31 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <IsPackable>false</IsPackable>
+    <AssemblyName>KestrelCache.Tests</AssemblyName>
+    <RootNamespace>KestrelCache.Tests</RootNamespace>
+    <NoWarn>$(NoWarn);CS1591</NoWarn>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.11.1" />
+    <PackageReference Include="xunit" Version="2.9.2" />
+    <PackageReference Include="xunit.runner.visualstudio" Version="2.8.2" />
+    <PackageReference Include="FsCheck.Xunit" Version="2.16.6" />
+    <PackageReference Include="Xunit.SkippableFact" Version="1.5.23" />
+    <PackageReference Include="coverlet.collector" Version="6.0.2" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="../../src/KestrelCache/KestrelCache.csproj" />
+
+    <!--
+      The crash-consistency tests spawn the CLI as a real child process and kill it with
+      SIGKILL. Referencing it with ReferenceOutputAssembly="false" makes the build produce the
+      executable those tests need without linking a console app into the test assembly.
+    -->
+    <ProjectReference Include="../../src/KestrelCache.Cli/KestrelCache.Cli.csproj"
+                      ReferenceOutputAssembly="false" />
+  </ItemGroup>
+
+</Project>

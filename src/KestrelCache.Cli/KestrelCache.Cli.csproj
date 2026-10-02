@@ -1,0 +1,13 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <AssemblyName>kestrel</AssemblyName>
+    <RootNamespace>KestrelCache.Cli</RootNamespace>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="../KestrelCache/KestrelCache.csproj" />
+  </ItemGroup>
+
+</Project>

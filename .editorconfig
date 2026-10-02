@@ -1,0 +1,35 @@
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+indent_style = space
+
+[*.{cs,csx}]
+indent_size = 4
+max_line_length = 120
+
+# Namespaces, usings, and modern C# style
+csharp_style_namespace_declarations = file_scoped:warning
+csharp_using_directive_placement = outside_namespace:warning
+dotnet_sort_system_directives_first = true
+csharp_prefer_braces = when_multiline:suggestion
+csharp_style_prefer_primary_constructors = true:suggestion
+csharp_style_var_for_built_in_types = false:suggestion
+csharp_style_var_when_type_is_apparent = true:suggestion
+
+# Readability rules that matter in a storage engine
+dotnet_diagnostic.CA2007.severity = none          # ConfigureAwait is used deliberately in the library
+dotnet_diagnostic.IDE0055.severity = suggestion
+
+[*.{yml,yaml,json}]
+indent_size = 2
+
+[*.{md,markdown}]
+indent_size = 2
+trim_trailing_whitespace = false
+
+[*.csproj]
+indent_size = 2
