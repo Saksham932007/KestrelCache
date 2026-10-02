@@ -212,6 +212,39 @@ The alternative — a reader/writer lock around the handle — would reintroduce
 the path that is supposed to scale, and could not be held across an `await` anyway, since
 `ReaderWriterLockSlim` has thread affinity.
 
+#### Which is where this stopped being portable
+
+Keeping the old generation open while the new one takes its name is free on POSIX and impossible
+on Windows, and the project only found out because CI runs the suite on all three platforms: every
+Bitcask compaction test failed on Windows, 15 of them, with one cause.
+
+A single `rename(2)` over an open file is fine on Linux and macOS — the old inode survives for
+whoever holds a descriptor, which is exactly the lifetime the reference counting wants. Windows
+refuses to replace a file that has open handles, and the obvious fix is not enough: granting
+`FileShare.Delete` does allow the file to be deleted while open, but its directory entry survives
+until the last handle closes. The name stays occupied by a file in "delete pending" state, and the
+rename still cannot land. The failure merely changes from `IOException` to
+`UnauthorizedAccessException`.
+
+What works is displacing rather than deleting. `File.Replace` renames the old log aside to
+`.superseded` — freeing the name at once, because renaming an open file is a different operation
+from unlinking one — and then renames the new log into place. Readers keep reading the old file
+under its new name, which is the same thing they were already doing with an unlinked inode.
+
+The cost is that installing a compacted log is now two renames rather than one, so there is a
+window with no file at the canonical path, and that window is more dangerous than it looks:
+opening a Bitcask log creates it on demand, so a crash lasting microseconds would otherwise replay
+as an empty database and read as every key having been deleted at once. Startup therefore repairs
+the state explicitly, and rolls *back* — the compacted file was fsynced before the swap and
+rolling forward would also be sound, but the superseded log is the one the rest of the system
+already believed in, and abandoning the compaction costs only the work of redoing it. Both halves
+of the window are tested directly, including the case where the second rename did land and
+rolling back would wrongly resurrect deleted keys.
+
+The engine no longer depends on rename-over-open being atomic on any platform, which is the real
+improvement: the previous version was correct on POSIX by accident of the filesystem rather than by
+construction.
+
 Measured: reads during continuous compaction run at 259,047/s with a p99 of 4.8 µs, against
 291,588/s and 4.4 µs idle. A 11% throughput cost and essentially no tail-latency penalty.
 

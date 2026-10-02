@@ -25,7 +25,7 @@ It speaks the Redis wire protocol, so `redis-cli` and `redis-benchmark` work aga
 | **A server** | RESP over `System.IO.Pipelines`, verified against the genuine `redis-cli` and `redis-benchmark`. |
 | **Replication** | Raft — leader election with pre-vote, log replication, persistent state, log snapshotting, and membership changes through joint consensus. Nodes join as non-voting learners and are promoted once caught up, so growing the cluster never costs it failure tolerance. |
 | **Observability** | Prometheus metrics with a latency histogram and engine internals, a provisioned Grafana dashboard, and fourteen alert rules. |
-| **305 tests** | Including a model-based fuzzer, single-bit-flip corruption sweeps, SIGKILL crash consistency, and a Raft Log Matching verifier run under up to 40% message loss. |
+| **307 tests** | Including a model-based fuzzer, single-bit-flip corruption sweeps, SIGKILL crash consistency, and a Raft Log Matching verifier run under up to 40% message loss. |
 
 **The design documents are the interesting part** — why each decision was made, what was measured,
 which bugs the measurements found, and what is still missing:
@@ -162,7 +162,7 @@ src/KestrelCache.Server/       RESP server
 
 src/KestrelCache.Cli/          a CLI, and the crash-test harness
 
-tests/KestrelCache.Tests/      305 tests
+tests/KestrelCache.Tests/      307 tests
   Engines/                       engine behaviour, fuzzing, corruption, crashes
   Server/                        RESP protocol over a real socket
   Consensus/                     elections, replication, snapshots, membership

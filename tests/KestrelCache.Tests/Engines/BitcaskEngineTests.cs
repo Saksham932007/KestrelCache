@@ -12,6 +12,82 @@ public sealed class BitcaskEngineTests
         AutoCompactStaleRatio = 0, // deterministic: tests drive compaction explicitly
     };
 
+    // Installing a compacted log is two renames -- the old one aside, the new one into place --
+    // which is what makes it work on Windows, where a rename cannot land on a name that an open
+    // file still occupies. The cost is a window between them where nothing exists at the
+    // canonical path, and the danger is specific: opening a Bitcask log creates it on demand, so
+    // without recovery a crash of microseconds' duration would replay as an empty database and
+    // read as every key having been deleted at once.
+    [Fact]
+    public async Task A_compaction_interrupted_between_its_two_renames_recovers_the_old_log()
+    {
+        using var dir = new TempDirectory();
+        var expected = new Dictionary<string, string>();
+
+        await using (var engine = await BitcaskEngine.OpenAsync(Options(dir.DbPath)))
+        {
+            for (int i = 0; i < 50; i++)
+            {
+                string value = $"value-{i}";
+                await engine.PutAsync(TestData.Key($"k{i}"), TestData.Value(value));
+                expected[$"k{i}"] = value;
+            }
+        }
+
+        // Exactly the state the first rename leaves behind: the live log parked under the backup
+        // name, and a complete replacement waiting under the temporary one.
+        string superseded = dir.DbPath + ".superseded";
+        string compacting = dir.DbPath + ".compacting";
+        File.Move(dir.DbPath, superseded);
+        File.WriteAllBytes(compacting, File.ReadAllBytes(superseded));
+
+        Assert.False(File.Exists(dir.DbPath));
+
+        await using var reopened = await BitcaskEngine.OpenAsync(Options(dir.DbPath));
+
+        // Rolled back, not forward, and above all not treated as a fresh database.
+        Assert.Equal(expected.Count, reopened.GetStats().KeyCount);
+        foreach (var (key, value) in expected)
+        {
+            Assert.Equal(value, TestData.Text(await reopened.GetAsync(TestData.Key(key))));
+        }
+
+        // And both leftovers are swept up, so the next compaction starts from a clean slate.
+        Assert.False(File.Exists(superseded));
+        Assert.False(File.Exists(compacting));
+    }
+
+    // The other half of the window: the second rename landed, so the canonical path holds the
+    // new log and the backup is merely litter. Recovery must leave the new log strictly alone --
+    // rolling back here would discard a completed compaction and resurrect deleted keys.
+    [Fact]
+    public async Task A_leftover_superseded_log_is_discarded_rather_than_restored()
+    {
+        using var dir = new TempDirectory();
+
+        await using (var engine = await BitcaskEngine.OpenAsync(Options(dir.DbPath)))
+        {
+            await engine.PutAsync(TestData.Key("keep"), TestData.Value("new"));
+            await engine.PutAsync(TestData.Key("gone"), TestData.Value("new"));
+            await engine.DeleteAsync(TestData.Key("gone"));
+            await engine.CompactAsync();
+        }
+
+        // A plausible stale backup: an older generation that still contains the deleted key.
+        string superseded = dir.DbPath + ".superseded";
+        await using (var stale = await BitcaskEngine.OpenAsync(Options(superseded)))
+        {
+            await stale.PutAsync(TestData.Key("keep"), TestData.Value("stale"));
+            await stale.PutAsync(TestData.Key("gone"), TestData.Value("stale"));
+        }
+
+        await using var reopened = await BitcaskEngine.OpenAsync(Options(dir.DbPath));
+
+        Assert.Equal("new", TestData.Text(await reopened.GetAsync(TestData.Key("keep"))));
+        Assert.Null(await reopened.GetAsync(TestData.Key("gone")));
+        Assert.False(File.Exists(superseded));
+    }
+
     [Fact]
     public async Task Get_returns_null_for_a_missing_key()
     {

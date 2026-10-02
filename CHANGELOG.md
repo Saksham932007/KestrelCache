@@ -25,12 +25,31 @@ chosen a toolchain is not a pin.
 **Every Bitcask compaction test failed on Windows** — 15 tests, one cause. Compaction installs the
 rewritten log by renaming over the live path while both files are still open. POSIX allows that
 unconditionally, which is the whole basis of the design: readers holding a descriptor finish
-against the old inode and never block. Windows refuses to replace a file unless every open handle
-to it granted delete sharing, so the install failed with "being used by another process" on every
-run while passing on Linux. The log is now opened `FileShare.Read | FileShare.Delete`, which makes
-Windows behave the way the compaction path already assumed. The alternative — closing the handle
-before the rename and reopening after, which is what the Raft log does — is simpler but stalls
-readers, and not stalling readers is what the positional-I/O design is for.
+against the old inode and never block.
+
+Granting `FileShare.Delete` was the obvious fix and was not enough. It lets Windows delete a file
+that has open handles, but the directory entry survives until the last one closes, so the name
+stays occupied by a delete-pending file and the rename still cannot land — the failure just
+changes from `IOException` to `UnauthorizedAccessException`. **Windows has no equivalent of
+rename-over-open, and no combination of share flags provides one.**
+
+What works is displacing rather than deleting: `File.Replace` renames the old log aside to
+`.superseded`, which frees the name immediately because renaming an open file is a different
+operation from unlinking one, then renames the new log into place. Readers carry on against the
+old file under its new name, exactly as they did against an unlinked inode.
+
+Installing a compacted log is therefore two renames now, and the window between them is more
+dangerous than it appears: opening a Bitcask log creates it on demand, so a crash lasting
+microseconds would replay as an empty database and read as every key having been deleted at once.
+Startup repairs that state explicitly and rolls back rather than forward — the compacted file was
+fsynced before the swap, so rolling forward would be sound too, but the superseded log is the one
+the rest of the system already believed in and abandoning the compaction costs only the work of
+redoing it. Two new tests cover both halves of the window, including the case where the second
+rename did land and rolling back would wrongly resurrect deleted keys.
+
+The engine no longer relies on rename-over-open being atomic on any platform, which is the part
+worth keeping: it was previously correct on POSIX by accident of the filesystem rather than by
+construction.
 
 **The container job checked for a metric that cannot exist yet.** `kestrelcache_engine_sstables`
 is emitted one series per level, so a tree that has never flushed exports a bare header and no

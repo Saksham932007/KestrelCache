@@ -76,6 +76,10 @@ public sealed class BitcaskEngine : IStorageEngine
             Directory.CreateDirectory(directory);
         }
 
+        // Before anything opens the log, because OpenLog would otherwise create an empty one and
+        // turn an interrupted compaction into silent total data loss.
+        RecoverInterruptedCompaction(options.Path);
+
         var stream = OpenLog(options.Path);
         try
         {
@@ -87,6 +91,53 @@ public sealed class BitcaskEngine : IStorageEngine
         {
             stream.Dispose();
             throw;
+        }
+    }
+
+    /// <summary>
+    /// Repairs the one state a crash during compaction can leave behind.
+    /// </summary>
+    /// <remarks>
+    /// Installing a compacted log is two renames, so there is a window in which the old log has
+    /// been moved aside and the new one has not yet landed -- no file at the canonical path at
+    /// all. Nothing else in the engine can be allowed to see that state, because opening the log
+    /// creates it on demand and an empty log replays as an empty database: a crash in a window of
+    /// microseconds would read as every key having been deleted.
+    /// <para>
+    /// Recovery rolls back rather than forward. The compacted file was fsynced before the swap
+    /// began, so rolling forward would also be sound, but the superseded log is the one the rest
+    /// of the system already believed in, and giving up the compaction costs nothing but the work
+    /// of redoing it.
+    /// </para>
+    /// </remarks>
+    private static void RecoverInterruptedCompaction(string path)
+    {
+        string superseded = path + ".superseded";
+
+        if (!File.Exists(path) && File.Exists(superseded))
+        {
+            File.Move(superseded, path);
+        }
+
+        // Either leftover is dead weight once the log itself is settled: the backup belongs to a
+        // swap that completed, and the temporary to one that never got far enough to matter.
+        TryDelete(superseded);
+        TryDelete(path + ".compacting");
+    }
+
+    private static void RestoreSupersededLog(string path, string supersededPath)
+    {
+        try
+        {
+            if (!File.Exists(path) && File.Exists(supersededPath))
+            {
+                File.Move(supersededPath, path);
+            }
+        }
+        catch (IOException)
+        {
+            // The next open retries this through RecoverInterruptedCompaction, which is the path
+            // that has to work anyway because a crash gets no chance to run this one at all.
         }
     }
 
@@ -795,19 +846,43 @@ public sealed class BitcaskEngine : IStorageEngine
                 throw;
             }
 
+            string supersededPath = store.Path + ".superseded";
+
             try
             {
-                File.Move(tempPath, store.Path, overwrite: true);
+                // File.Replace, not File.Move(overwrite: true), and the difference is entirely
+                // about Windows. Both files are still open here -- readers are mid-flight on the
+                // old one and the new one is about to become the live handle. POSIX renames over
+                // an open file without complaint, so File.Move was correct on Linux and macOS and
+                // failed every time on Windows: there, granting FileShare.Delete allows the old
+                // file to be *deleted* while open, but its directory entry survives until the
+                // last handle closes, so the name stays occupied and the rename cannot land.
+                //
+                // Replace displaces instead of deleting. The old log is renamed aside to
+                // .superseded -- which frees the name immediately, on Windows as on POSIX,
+                // because renaming an open file is not the same operation as unlinking one -- and
+                // the new log is renamed into place. Readers holding the old handle keep reading
+                // it under its new name, exactly as they kept reading the unlinked inode before.
+                File.Replace(tempPath, store.Path, supersededPath);
             }
             catch
             {
                 newStream.Dispose();
                 TryDelete(tempPath);
+
+                // Replace is not atomic end to end, so a failure can leave the old log parked
+                // under the backup name with nothing at the real one.
+                RestoreSupersededLog(store.Path, supersededPath);
                 throw;
             }
 
             var replacement = BitcaskStore.Create(store.Path, newStream, newIndex, newOffset, newLiveBytes);
             previous = Interlocked.Exchange(ref _store, replacement);
+
+            // The swap has landed, so the displaced log is now only holding disk. On Windows the
+            // readers still working against it make this a delete-pending rather than an
+            // immediate unlink, which is the same thing POSIX has been doing all along.
+            TryDelete(supersededPath);
 
             Interlocked.Increment(ref _compactions);
             Interlocked.Add(ref _compactionBytesWritten, bytesWritten);
@@ -829,9 +904,12 @@ public sealed class BitcaskEngine : IStorageEngine
         {
             File.Delete(path);
         }
-        catch (IOException)
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
-            // Best effort; a stale .compacting file is harmless and will be overwritten.
+            // Best effort. A stale .compacting file is harmless and will be overwritten, and a
+            // superseded log that Windows will not unlink yet because readers still hold it is
+            // not a failure either: it is out of the way, which was the point, and the next open
+            // sweeps it up.
         }
     }
 
