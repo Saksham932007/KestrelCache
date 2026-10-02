@@ -188,6 +188,103 @@ jobs:
         if: always()
         run: docker compose -f deploy/docker-compose.yml down -v || true
 
+  cluster:
+    name: replicated cluster
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Bring a three-node cluster up
+        run: >
+          docker compose -f deploy/docker-compose.cluster.yml up -d --build
+          --wait --wait-timeout 240 kc1 kc2 kc3
+
+      # The whole point of consensus is that exactly one node leads. Asserting it from outside is
+      # the cheapest check that the cluster actually formed rather than three nodes campaigning
+      # at each other forever.
+      - name: Wait for exactly one leader
+        run: |
+          cli() { docker run --rm --network host redis:7-alpine redis-cli "$@"; }
+          for i in $(seq 1 60); do
+            leaders=0
+            for p in 6381 6382 6383; do
+              if cli -p $p cluster info 2>/dev/null | grep -q 'role:leader'; then
+                leaders=$((leaders + 1))
+                leader_port=$p
+              fi
+            done
+            if [ "$leaders" = "1" ]; then
+              echo "one leader, on port $leader_port"
+              echo "LEADER_PORT=$leader_port" >> "$GITHUB_ENV"
+              exit 0
+            fi
+            sleep 2
+          done
+          for p in 6381 6382 6383; do echo "--- $p ---"; cli -p $p cluster info || true; done
+          echo "the cluster never settled on a single leader"
+          exit 1
+
+      - name: Writes replicate to every node
+        run: |
+          cli() { docker run --rm --network host redis:7-alpine redis-cli "$@"; }
+          test "$(cli -p "$LEADER_PORT" SET replicated yes)" = "OK"
+          sleep 2
+          for p in 6381 6382 6383; do
+            got=$(cli -p $p GET replicated)
+            test "$got" = "yes" || { echo "port $p has '$got', expected 'yes'"; exit 1; }
+          done
+          echo "replicated to all three nodes"
+
+      - name: A follower refuses writes and names the leader
+        run: |
+          cli() { docker run --rm --network host redis:7-alpine redis-cli "$@"; }
+          for p in 6381 6382 6383; do
+            if [ "$p" != "$LEADER_PORT" ]; then
+              reply=$(cli -p $p SET viaFollower nope)
+              echo "follower on $p replied: $reply"
+              echo "$reply" | grep -q NOTLEADER || { echo "expected -NOTLEADER"; exit 1; }
+              exit 0
+            fi
+          done
+
+      # Killing the leader is the test that matters. A cluster that cannot elect a replacement is
+      # strictly worse than a single node, since it has the same availability and three times the
+      # hardware.
+      - name: Killing the leader elects a new one, with data intact
+        run: |
+          cli() { docker run --rm --network host redis:7-alpine redis-cli "$@"; }
+          case "$LEADER_PORT" in
+            6381) victim=kc1 ;; 6382) victim=kc2 ;; *) victim=kc3 ;;
+          esac
+          echo "killing $victim"
+          docker compose -f deploy/docker-compose.cluster.yml kill "$victim"
+
+          for i in $(seq 1 60); do
+            for p in 6381 6382 6383; do
+              [ "$p" = "$LEADER_PORT" ] && continue
+              if cli -p $p cluster info 2>/dev/null | grep -q 'role:leader'; then
+                echo "new leader on port $p"
+                test "$(cli -p $p GET replicated)" = "yes" \
+                  || { echo "data written before the failure was lost"; exit 1; }
+                test "$(cli -p $p SET afterFailover yes)" = "OK" \
+                  || { echo "the new leader will not accept writes"; exit 1; }
+                echo "failover verified"
+                exit 0
+              fi
+            done
+            sleep 2
+          done
+          echo "no new leader was elected after the old one was killed"
+          exit 1
+
+      - name: Dump logs on failure
+        if: failure()
+        run: docker compose -f deploy/docker-compose.cluster.yml logs
+
+      - name: Tear down
+        if: always()
+        run: docker compose -f deploy/docker-compose.cluster.yml down -v || true
+
   format:
     name: format
     runs-on: ubuntu-latest
