@@ -117,6 +117,11 @@ free safety switch. Hence three policies:
 | `Interval` | 94,605 writes/s | at most one interval's acknowledged writes lost |
 | `EveryWrite` | 1,040 writes/s | an acknowledged write is durable, full stop |
 
+The `Interval` row describes the policy as designed. Only the Bitcask engine implements it: its
+background timer syncs every `SyncInterval` (200 ms by default). The LSM engine accepts `Interval`
+and counts unsynced writes, but nothing reads that counter, so on LSM it behaves like `None` until
+a memtable flush, `FlushAsync` or close. Read the `Interval` cost figure with that in mind.
+
 `Interval` is the default because it is what real deployments run, and because the measured cost
 over `None` is under 6% while the exposure is bounded.
 
@@ -152,6 +157,11 @@ outlives a killed process, so these tests prove crash consistency and prove the 
 they cannot prove fsync was issued. The crash test with `SyncPolicy.None` makes this concrete — it
 reports *7,061 of 7,061* acknowledged writes surviving without a single fsync. Proving the rest
 needs the kernel out of the picture too: a VM reset, or a device-mapper `flakey` target.
+
+Two further gaps no test covers: there is no fsync of the containing directory after a new log or
+SSTable is created or the manifest is renamed into place, so a synced file can lose its directory
+entry in a power cut; and replay only guarantees a checksummed prefix, because the kernel may write
+back later pages before earlier ones, in which case everything after the first hole is discarded.
 
 ### One finding worth repeating
 
@@ -189,15 +199,17 @@ four hardware threads.
 
 Writes must serialise: the log is one file and the memtable takes one writer. Doing them one at a
 time meant each paid for its own lock acquisition, its own `pwrite` and its own fsync, and the
-measurement said so — throughput was flat at roughly 49,000 writes/s whether fsync was enabled or
-disabled, and client pipelining lifted writes by 20% while lifting reads by 4.7x. Reads scaled with
+measurement said so — throughput was flat at roughly 49,000 writes/s with fsync disabled, so the device was not in
+the acknowledgement path, and client pipelining lifted writes by 20% while lifting reads by 4.7x. Reads scaled with
 concurrency and writes did not: the lock *was* the queue, and no amount of client pipelining could
 widen it.
 
 Group commit fixes the shape. A writer enqueues its batch and then competes for the lock; whoever
-wins becomes the leader and commits everything queued — one lock acquisition, one write, one fsync
-for the whole group — then wakes the others. Throughput went from 49,456 to 82,440 writes/s *while
-moving from no fsync to interval fsync*. The busier the server, the larger the groups and the
+wins becomes the leader and commits everything queued — one lock acquisition, one write, and under `EveryWrite` one fsync
+for the whole group — then wakes the others. Throughput went from 49,456 to 82,440 writes/s. That
+run used the default `Interval` policy, which the LSM engine does not sync on a timer (see
+[section 2](#2-durability-what-durable-actually-means)), so it was not a move from no fsync to interval
+fsync; no number is published for group commit under `EveryWrite`. The busier the server, the larger the groups and the
 better the amortisation, which is the opposite of how the one-at-a-time path degraded.
 
 ### Compaction does not disturb readers
@@ -421,7 +433,8 @@ speaks to it; and `redis-benchmark` can be pointed at it to produce numbers dire
 with Redis itself. A bespoke protocol would have required writing all of that.
 
 Measured against Redis 7 with `appendfsync everysec`, same machine, 100k ops, 50 clients, pipeline
-depth 16:
+depth 16. Redis fsyncs once a second there and the LSM engine's `Interval` policy does not sync on a
+timer, so this is not a like-for-like durability comparison:
 
 | | KestrelCache | Redis 7 | ratio |
 | --- | ---: | ---: | ---: |

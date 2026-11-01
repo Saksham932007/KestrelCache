@@ -189,8 +189,8 @@ internal sealed class WriteAheadLog : IAsyncDisposable
     /// This is the log-side half of group commit. Each batch keeps its own checksummed record,
     /// so per-batch atomicity across recovery is unchanged — a torn record still loses exactly
     /// one batch and never half of one. What changes is that the whole group leaves the process
-    /// in one <c>pwrite</c> and is made durable by one <c>fsync</c>, instead of one of each per
-    /// batch.
+    /// in one <c>pwrite</c> and, under <c>EveryWrite</c>, is made durable by one <c>fsync</c>,
+    /// instead of one of each per batch.
     /// </para>
     /// <para>
     /// The measurement that motivated it: write throughput sat at roughly 49,000 ops/sec with

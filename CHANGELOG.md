@@ -222,9 +222,9 @@ RESP over `System.IO.Pipelines`, verified against the genuine `redis-cli` and `r
 GET within 1.4x of Redis 7; SET 6.6x.
 
 Group commit, which the benchmark identified rather than guessed at: writes were flat at ~49,000/s
-whether fsync was on or off while reads scaled 4.7x with pipelining — the signature of a serialised
-path, not a slow device. SET went from 49,456 to 82,440/s *while* moving from no fsync to interval
-fsync.
+with fsync disabled while reads scaled 4.7x with pipelining — the signature of a serialised
+path, not a slow device. SET went from 49,456 to 82,440/s. (Correction: that run used the default `Interval` policy, which
+the LSM engine accepts but does not sync on a timer, so it was not a move to interval fsync.)
 
 Prometheus metrics with a latency histogram, a 22-panel provisioned Grafana dashboard, six alert
 rules, a non-root container image, and compose stacks for single-node and clustered deployments.

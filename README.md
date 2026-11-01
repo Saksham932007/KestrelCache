@@ -25,7 +25,7 @@ It speaks the Redis wire protocol, so `redis-cli` and `redis-benchmark` work aga
 | | |
 | --- | --- |
 | **Two storage engines** | A Bitcask-style append-only log with an in-memory hash index, and a log-structured merge tree with a write-ahead log, memtable, levelled SSTables, Bloom filters and a block cache. Both behind one interface, so their trade-offs are measured rather than asserted. |
-| **Real durability** | Three fsync policies with the cost of each measured, group commit to amortise it, and crash tests that `SIGKILL` a real process and verify every acknowledged write came back. |
+| **Durability** | Three fsync policies with the cost of each measured, group commit to amortise it, and crash tests that `SIGKILL` a real process and verify every acknowledged write survives a process crash. Power-loss durability is not tested, and the limits are listed under [Durability limits](#durability-limits). |
 | **A server** | RESP over `System.IO.Pipelines`, verified against the genuine `redis-cli` and `redis-benchmark`. |
 | **Replication** | Raft — leader election with pre-vote, log replication, persistent state, log snapshotting, and membership changes through joint consensus. Nodes join as non-voting learners and are promoted once caught up, so growing the cluster never costs it failure tolerance. |
 | **Observability** | Prometheus metrics with a latency histogram and engine internals, a provisioned Grafana dashboard, and fourteen alert rules. |
@@ -49,7 +49,8 @@ server hardware; the ratios are the point. See [Measurement conditions](docs/DES
 ### Against Redis 7
 
 `redis-benchmark`, 100k ops, 50 clients, pipeline depth 16, Redis configured with
-`appendfsync everysec`:
+`appendfsync everysec` (Redis fsyncs once a second; the LSM engine's `Interval` policy does not sync on a
+timer, so this is not a like-for-like durability comparison, see [Durability limits](#durability-limits)):
 
 | | KestrelCache | Redis 7 | ratio |
 | --- | ---: | ---: | ---: |
@@ -310,10 +311,12 @@ from outside.
 [Details](docs/REPLICATION.md#three-safety-bugs-one-test-found)
 
 **A write path that could not be made faster by pipelining.** Throughput was flat at ~49,000
-writes/s whether fsync was on or off, while reads scaled 4.7x with pipelining. Reads scaling and
+writes/s with fsync disabled, so the device was not in the acknowledgement path, while reads scaled
+4.7x with pipelining. Reads scaling and
 writes not is the signature of a serialised path rather than a slow device: every writer took the
 same lock and issued its own syscall, so the lock *was* the queue. Group commit took SET from
-49,456 to 82,440/s while simultaneously moving from no fsync to interval fsync.
+49,456 to 82,440/s. That run used the default `Interval` policy, which the LSM engine does not yet
+sync on a timer, so it is a no-background-fsync figure, not a move from no fsync to interval fsync.
 [Details](docs/DESIGN.md#writes-serialise-and-group-commit-makes-that-cheap)
 
 **A removed cluster member that drove a settled cluster from term 1 to term 22.** Dropping a
@@ -363,6 +366,26 @@ the RESP server, Prometheus metrics, and Raft replication with failover, catch-u
 pre-vote, learner members and live membership changes. The suite runs on Linux, macOS and Windows,
 and the container, compose and replicated-cluster paths are exercised end to end in CI against the
 genuine `redis-cli`.
+
+### Durability limits
+
+- **What `OK` means.** Under `Interval` or `None`, `OK` means the batch was appended to the log with
+  one `pwrite` (the OS page cache) and applied to the memtable. It is not on the device, and another
+  client can read it before it is. Under `EveryWrite`, one fsync covers the whole commit group and
+  completes before any writer in the group is acknowledged.
+- **Power loss.** Acknowledged writes since the last fsync can be lost. Recovery stops at the first
+  record that fails its checksum, so what comes back is a prefix of the log and every batch is
+  all-or-nothing, but the prefix can be shorter than what was acknowledged.
+- **`Interval` on the LSM engine is not implemented.** Only the Bitcask engine runs the background
+  sync timer (200 ms by default). The LSM engine, the server default, accepts the policy and counts
+  unsynced writes but never syncs on a timer. Its WAL is fsynced under `EveryWrite`, on `FlushAsync`,
+  on close, and when a memtable flush makes the SSTable and manifest durable before the log is
+  deleted. So on LSM the loss window is bounded by memtable size, not by time.
+- **No directory fsync.** New log and SSTable files, and the manifest rename, are not followed by an
+  fsync of the containing directory, so a file whose contents were synced can still be missing its
+  directory entry after power loss.
+- **Crash tests are `SIGKILL` only.** The page cache survives a killed process, so they prove the
+  recovery path, not that an fsync was issued.
 
 Known gaps, stated plainly:
 

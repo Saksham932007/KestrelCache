@@ -38,6 +38,9 @@ public enum SyncPolicy
     /// fsync on a background interval (see <see cref="DatabaseOptions.SyncInterval"/>).
     /// A bounded-loss compromise: at most one interval's worth of acknowledged writes can be
     /// lost to power failure. This is the policy most real deployments actually run.
+    /// Implemented by the Bitcask engine's background timer only: the LSM engine accepts this
+    /// policy but does not sync on a timer, so there it behaves like
+    /// <see cref="SyncPolicy.None"/> until a memtable flush, an explicit flush, or close.
     /// </summary>
     Interval = 2,
 }
